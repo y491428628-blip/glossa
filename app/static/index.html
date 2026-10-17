@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Glossa</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='9' width='28' height='15' rx='3' fill='%23f5e15a'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='16' text-anchor='middle' fill='%231b2440'%3EGl%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- ============ sign in / first-run setup ============ -->
+<section id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="auth-word">Gl<span>oss</span>a</div>
+    <p class="auth-sample">Your team's shared translation memory. Every term translated the same way, every repeat served for free.</p>
+
+    <form id="setup-form" class="stack" hidden>
+      <h2>Set up Glossa</h2>
+      <p class="muted">Choose an admin password. Your teammates never need it; they only need the team key.</p>
+      <label class="field"><span class="field-label">Team name</span>
+        <input type="text" name="team_name" placeholder="UNSW Chinese Students Association" maxlength="80"></label>
+      <label class="field"><span class="field-label">Admin password</span>
+        <input type="password" name="password" minlength="8" required autocomplete="new-password">
+        <span class="field-help">At least 8 characters.</span></label>
+      <p class="form-error" role="alert"></p>
+      <button class="btn btn-primary" type="submit">Create admin account</button>
+    </form>
+
+    <form id="login-form" class="stack" hidden>
+      <h2>Sign in</h2>
+      <label class="field"><span class="field-label">Admin password</span>
+        <input type="password" name="password" required autocomplete="current-password">
+        <span class="field-help">On Zenith, find it under your deployment's environment as ADMIN_PASSWORD.</span></label>
+      <p class="form-error" role="alert"></p>
+      <button class="btn btn-primary" type="submit">Sign in</button>
+    </form>
+  </div>
+</section>
+
+<!-- ============ app ============ -->
+<div id="app" hidden>
+  <header class="bar">
+    <div class="bar-inner">
+      <a class="brand" href="#overview"><span class="brand-word">Gl<span>oss</span>a</span><span class="brand-team" id="team-name"></span></a>
+      <nav class="nav" aria-label="Main">
+        <a href="#overview" data-view="overview">Overview</a>
+        <a href="#glossary" data-view="glossary">Glossary</a>
+        <a href="#try" data-view="try">Try it</a>
+        <a href="#settings" data-view="settings">Settings</a>
+      </nav>
+      <button class="signout" id="signout" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ---------- overview ---------- -->
+    <section id="view-overview" data-view-panel="overview" hidden>
+      <div class="notice" id="setup-notice" hidden>
+        <p><strong>Add an AI provider to start translating.</strong> Glossa uses your own API key, so you control the cost.</p>
+        <a class="btn btn-primary" href="#settings">Open settings</a>
+      </div>
+
+      <p class="statement" id="statement"></p>
+      <p class="lede" id="statement-sub"></p>
+
+      <div class="overview-grid">
+        <div class="stack">
+          <div class="panel">
+            <div class="section-head" style="margin-bottom:4px">
+              <h3>Paragraphs translated, last 14 days</h3>
+            </div>
+            <div class="legend" aria-hidden="true">
+              <span><i style="background:var(--series-memory)"></i>From memory</span>
+              <span><i style="background:var(--series-new)"></i>Newly translated</span>
+            </div>
+            <div class="chart" id="chart"></div>
+          </div>
+
+          <div class="panel">
+            <h3 style="margin-bottom:6px">Most used terms</h3>
+            <ul class="term-list" id="top-terms"></ul>
+          </div>
+        </div>
+
+        <div class="panel" id="connect">
+          <h2 style="margin-bottom:6px">Connect Immersive Translate</h2>
+          <p class="muted" style="margin-bottom:20px">Each teammate does this once in their browser extension.</p>
+          <ol class="steps">
+            <li>Open Immersive Translate's settings and go to <strong>Translation services</strong> (翻译服务).</li>
+            <li>Choose <strong>OpenAI</strong> and switch on <strong>Custom API Key</strong> (自定义 API Key).</li>
+            <li>Paste the API address (自定义 API 接口地址):
+              <div class="copy-field"><code id="ep-openai"></code><button class="btn" type="button" data-copy="ep-openai">Copy</button></div>
+            </li>
+            <li>Paste the team key as the API key:
+              <div class="copy-field"><code id="team-key"></code><button class="btn" type="button" data-copy="team-key">Copy</button></div>
+              <span class="field-help">Any model name works. Glossa always uses the model chosen in Settings.</span>
+            </li>
+            <li>Set OpenAI as your translation service and open any foreign-language page.</li>
+          </ol>
+          <div class="row" style="margin-top:24px">
+            <button class="btn btn-primary" type="button" id="copy-invite">Copy setup message for your team</button>
+          </div>
+          <details class="more" style="margin-top:20px">
+            <summary>Prefer the custom API option?</summary>
+            <p class="small muted">In Immersive Translate, turn on Beta features under Developer settings, then add a Custom API (自定义 API) service with this address:</p>
+            <div class="copy-field"><code id="ep-custom"></code><button class="btn" type="button" data-copy="ep-custom">Copy</button></div>
+            <p class="small muted" style="margin-top:8px">This route caches paragraph by paragraph, so memory works even when two pages share only a few sentences.</p>
+          </details>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head"><h2>Recent activity</h2></div>
+        <div class="panel table-wrap" id="recent"></div>
+      </div>
+    </section>
+
+    <!-- ---------- glossary ---------- -->
+    <section id="view-glossary" data-view-panel="glossary" hidden>
+      <div class="section-head">
+        <div>
+          <h1>Glossary</h1>
+          <p class="lede">Terms here are translated exactly this way for everyone on your team, in the extension and in Try it.</p>
+        </div>
+        <div class="row">
+          <label class="btn" for="import-file">Import CSV</label>
+          <input type="file" id="import-file" accept=".csv,text/csv" class="sr-only">
+          <a class="btn" href="/api/glossary/export">Export CSV</a>
+        </div>
+      </div>
+
+      <form class="panel add-term" id="add-term">
+        <label class="field"><span class="field-label">Term</span><input type="text" name="source" required placeholder="census date" maxlength="200" class="lang-text"></label>
+        <label class="field"><span class="field-label">Always translate as</span><input type="text" name="target" required placeholder="退课截止日" maxlength="200" class="lang-text"></label>
+        <label class="field"><span class="field-label">Into</span><select name="target_lang" class="lang-select"></select></label>
+        <label class="field"><span class="field-label">Note <span class="muted">(optional)</span></span><input type="text" name="note" maxlength="300" placeholder="Last day to drop without fees"></label>
+        <button class="btn btn-primary add-btn" type="submit">Add term</button>
+      </form>
+
+      <div class="section-head" style="margin-top:28px">
+        <h2 id="glossary-count">Terms</h2>
+        <input type="search" id="glossary-search" placeholder="Search terms" style="max-width:280px" aria-label="Search terms">
+      </div>
+      <div class="panel table-wrap" id="glossary-list"></div>
+
+      <div class="section">
+        <div class="panel stack">
+          <div>
+            <h2>Find terms in a sample</h2>
+            <p class="lede">Paste a notice, a syllabus or a page your team reads often. The AI picks out names and phrases worth fixing in the glossary, and you choose which to keep.</p>
+          </div>
+          <textarea id="suggest-text" class="lang-text" placeholder="Paste a paragraph or more…"></textarea>
+          <div class="row">
+            <button class="btn btn-primary" type="button" id="suggest-btn">Suggest terms</button>
+            <span class="muted small" id="suggest-status"></span>
+          </div>
+          <div id="suggest-results" hidden>
+            <ul class="suggestions" id="suggest-list"></ul>
+            <div class="row" style="margin-top:12px"><button class="btn btn-primary" type="button" id="suggest-add">Add selected terms</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- try it ---------- -->
+    <section id="view-try" data-view-panel="try" hidden>
+      <h1>Try it</h1>
+      <p class="lede">Translate a sample the same way the extension does. Glossary terms are highlighted on both sides; paragraphs with a green rule came from team memory.</p>
+      <div class="try-grid section" style="margin-top:24px">
+        <form class="panel stack try-input" id="try-form">
+          <label class="field"><span class="field-label">Text</span>
+            <textarea name="text" id="try-text" placeholder="Paste English text. Each line is translated as its own paragraph."></textarea></label>
+          <div class="row">
+            <label class="field" style="flex:1; min-width:160px"><span class="sr-only">Translate into</span><select name="target_lang" class="lang-select" aria-label="Translate into"></select></label>
+            <button class="btn" type="button" id="try-sample">Use a sample</button>
+            <button class="btn btn-primary" type="submit">Translate</button>
+          </div>
+        </form>
+        <div class="panel" id="try-output" aria-live="polite">
+          <p class="result-empty">The translation appears here. Run the same text twice to see memory at work.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- settings ---------- -->
+    <section id="view-settings" data-view-panel="settings" hidden>
+      <h1>Settings</h1>
+      <form id="settings-form" class="section" style="margin-top:28px">
+        <div class="settings-grid">
+          <div class="settings-side"><h3>AI provider</h3><p>Any service with an OpenAI-compatible API. Your key stays on this server and is sent only to the provider you choose.</p></div>
+          <div class="stack">
+            <label class="field"><span class="field-label">Provider</span><select name="provider" id="provider"></select></label>
+            <div class="grid-2">
+              <label class="field"><span class="field-label">API address</span><input type="url" name="llm_base_url" required></label>
+              <label class="field"><span class="field-label">Model</span><input type="text" name="llm_model" required></label>
+            </div>
+            <label class="field"><span class="field-label">API key</span>
+              <input type="password" name="llm_api_key" autocomplete="off" id="api-key-input">
+              <span class="field-help" id="api-key-help">Leave blank to keep the saved key.</span></label>
+            <div class="row">
+              <button class="btn" type="button" id="test-btn">Test connection</button>
+              <span class="test-result" id="test-result"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <div class="settings-side"><h3>Translation</h3><p>Applied to every request from every teammate.</p></div>
+          <div class="stack">
+            <label class="field"><span class="field-label">Default language</span><select name="default_target_lang" class="lang-select"></select>
+              <span class="field-help">Used when a request doesn't say which language it wants, and for new glossary terms.</span></label>
+            <label class="field"><span class="field-label">Style guide</span>
+              <textarea name="style_guide" placeholder="Keep course codes such as COMP2521 in English. Use a friendly tone. Translate 'society' as 社团."></textarea>
+              <span class="field-help">Plain instructions added to every translation.</span></label>
+            <div class="grid-2">
+              <label class="field"><span class="field-label">Temperature <span class="muted">(optional)</span></span><input type="number" name="temperature" min="0" max="2" step="0.1" placeholder="Provider default">
+                <span class="field-help">Leave blank for reasoning models that only accept the default.</span></label>
+              <label class="field"><span class="field-label">Price per million tokens (USD)</span><input type="number" name="price_per_m_tokens" min="0" step="0.01">
+                <span class="field-help">Only used to estimate savings on the overview.</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <div class="settings-side"><h3>Team</h3></div>
+          <div class="stack">
+            <label class="field"><span class="field-label">Team name</span><input type="text" name="team_name" maxlength="80"></label>
+            <div class="row"><button class="btn btn-primary" type="submit">Save settings</button></div>
+          </div>
+        </div>
+      </form>
+
+      <div class="settings-grid settings-sep">
+        <div class="settings-side"><h3>Access and memory</h3><p>Actions here take effect immediately.</p></div>
+        <div class="stack">
+          <div class="row" style="justify-content:space-between">
+            <div><strong>Team key</strong><p class="muted small">Generate a new key if someone leaves the team. Everyone else will need the new key.</p></div>
+            <button class="btn btn-danger" type="button" id="rotate-btn">Generate new key</button>
+          </div>
+          <div class="row" style="justify-content:space-between">
+            <div><strong>Translation memory</strong><p class="muted small" id="memory-size">Saved translations are reused for everyone.</p></div>
+            <button class="btn btn-danger" type="button" id="clear-btn">Clear memory</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

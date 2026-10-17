@@ -1,0 +1,80 @@
+x-zenith:
+  catalog:
+    name: Glossa
+    description: A shared glossary and translation memory for teams that read in other languages with Immersive Translate.
+    detail: >-
+      Glossa sits between your team's Immersive Translate extension and your own AI provider.
+      Terms in the team glossary are translated the same way for everyone, and any paragraph a
+      teammate has already translated is served from shared memory instead of being paid for again.
+      A dashboard shows the glossary, a live try-it view and how much the memory has saved.
+    authors:
+      - Tony
+    tags:
+      - translation
+      - glossary
+      - ai
+      - immersive-translate
+    source: https://github.com/y491428628-blip/glossa
+    license: MIT
+    alternatives:
+      - Immersive Translate Pro
+      - DeepL Pro
+  expose:
+    - service: web
+      port: 8080
+      web: true
+  storage:
+    data:
+      volume: glossa_data
+      label: Glossary and translation memory
+      description: SQLite database holding the glossary, saved translations and settings.
+  env:
+    ADMIN_PASSWORD:
+      generate: '([A-Za-z0-9]{8})([A-Za-z0-9]{8})'
+      input:
+        label: Admin password
+        description: Signs you in to the Glossa dashboard. Teammates never need it.
+        secret: true
+      services:
+        - web
+    PUBLIC_URL:
+      alias: ZENITH_PUBLIC_URL
+      services:
+        - web
+    LLM_BASE_URL:
+      input:
+        label: AI provider API address
+        description: Any OpenAI-compatible API. You can change this later in the dashboard.
+        default: https://api.openai.com/v1
+      services:
+        - web
+    LLM_MODEL:
+      input:
+        label: AI model
+        default: gpt-4.1-mini
+      services:
+        - web
+    LLM_API_KEY:
+      input:
+        label: AI provider API key
+        description: Optional here. You can also add it later in the dashboard's Settings.
+        secret: true
+      services:
+        - web
+
+services:
+  web:
+    build: .
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - glossa_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  glossa_data:
