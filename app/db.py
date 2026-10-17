@@ -59,7 +59,28 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+
+CREATE TABLE IF NOT EXISTS upstream_calls (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL NOT NULL,
+    model      TEXT NOT NULL,
+    items      INTEGER NOT NULL DEFAULT 0,
+    status     INTEGER NOT NULL DEFAULT 0,
+    ms         INTEGER NOT NULL DEFAULT 0,
+    ok         INTEGER NOT NULL DEFAULT 1,
+    error_code TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_upstream_calls_ts ON upstream_calls (ts);
 """
+
+# Columns added after v0.1.0. Existing databases are upgraded in place on startup.
+MIGRATIONS = {
+    "events": {
+        "glossary_direct": "INTEGER NOT NULL DEFAULT 0",
+        "error_code": "TEXT NOT NULL DEFAULT ''",
+    },
+}
 
 
 class Database:
@@ -73,6 +94,11 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SCHEMA)
+            for table, columns in MIGRATIONS.items():
+                existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+                for name, decl in columns.items():
+                    if name not in existing:
+                        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             self._conn.commit()
 
     # -- low level -----------------------------------------------------------------
@@ -219,15 +245,23 @@ class Database:
 
     # -- events --------------------------------------------------------------------
     def log_event(self, **fields: Any) -> None:
+        text_cols = ("endpoint", "error", "error_code")
         cols = [
-            "endpoint", "items", "cache_hits", "llm_calls", "chars_in", "chars_cached",
-            "terms_matched", "terms_applied", "ms", "ok", "error",
+            "endpoint", "items", "cache_hits", "glossary_direct", "llm_calls", "chars_in", "chars_cached",
+            "terms_matched", "terms_applied", "ms", "ok", "error", "error_code",
         ]
-        values = [fields.get(c, 0 if c not in ("endpoint", "error") else "") for c in cols]
+        values = [fields.get(c, "" if c in text_cols else 0) for c in cols]
         values[cols.index("ok")] = int(bool(fields.get("ok", True)))
+        values[cols.index("error")] = str(values[cols.index("error")])[:4000]
         self.execute(
             f"INSERT INTO events (ts, {', '.join(cols)}) VALUES (?, {', '.join('?' * len(cols))})",
             (time.time(), *values),
+        )
+
+    def log_call(self, model: str, items: int, status: int, ms: int, ok: bool, error_code: str = "") -> None:
+        self.execute(
+            "INSERT INTO upstream_calls (ts, model, items, status, ms, ok, error_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), model, items, status, ms, int(ok), error_code),
         )
 
 

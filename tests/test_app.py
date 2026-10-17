@@ -1,4 +1,7 @@
+import asyncio
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -8,15 +11,29 @@ from app import db as dbmod
 from app import engine
 from tests import mock_llm
 
+IMMERSIVE_SYSTEM = "You are a professional, authentic machine translation engine."
+
+
+def immersive_prompt(paragraphs, lang="Simplified Chinese"):
+    body = "".join(f"[[p{i}]]\n {p} \n" for i, p in enumerate(paragraphs))
+    return {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": IMMERSIVE_SYSTEM},
+            {"role": "user", "content": f"Translate to {lang} Language:\n\n{body}[[source_end]]"},
+        ],
+    }
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr(engine, "COALESCE_SECONDS", 0.05)
     database = dbmod.Database(tmp_path / "test.db")
     dbmod.set_db(database)
     engine.MATCHER = engine.GlossaryMatcher()
-    mock_llm.app.state.calls = 0
-    mock_llm.app.state.break_json = False
+    engine.reset_dispatcher()
+    mock_llm.reset()
     engine.set_http_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=mock_llm.app)))
 
     from app.main import create_app
@@ -24,31 +41,40 @@ def client(tmp_path, monkeypatch):
     with TestClient(create_app()) as c:
         yield c
     engine.set_http_client(None)
+    engine.reset_dispatcher()
     dbmod.set_db(None)
 
 
-def setup_admin(c):
+def setup_admin(c, max_rpm="0"):
     r = c.post("/api/setup", json={"password": "correct-horse", "team_name": "UNSW CSSA"})
     assert r.status_code == 200, r.text
     r = c.put(
         "/api/settings",
-        json={"llm_base_url": "http://mock/v1", "llm_api_key": "sk-test", "llm_model": "mock-1", "default_target_lang": "zh-CN"},
+        json={"llm_base_url": "http://mock/v1", "llm_api_key": "sk-test", "llm_model": "mock-1",
+              "default_target_lang": "zh-CN", "max_rpm": max_rpm},
     )
     assert r.status_code == 200, r.text
     return c.get("/api/overview").json()["team_key"]
 
 
+def imme(c, key, texts, lang="zh-CN"):
+    return c.post(f"/imme?token={key}", json={"source_lang": "auto", "target_lang": lang, "text_list": texts})
+
+
+# ------------------------------------------------------------------ auth and settings
 def test_setup_login_flow(client):
     assert client.get("/api/me").json()["setup_required"] is True
-    assert client.get("/api/overview").status_code == 401
+    r = client.get("/api/overview")
+    assert r.status_code == 401 and r.json()["code"] == "not_signed_in"
     setup_admin(client)
     assert client.get("/api/me").json() == {
-        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.1.0",
+        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.2.0",
     }
     client.post("/api/logout")
-    assert client.post("/api/login", json={"password": "nope"}).status_code == 401
+    r = client.post("/api/login", json={"password": "nope"})
+    assert r.status_code == 401 and r.json()["code"] == "wrong_password"
     assert client.post("/api/login", json={"password": "correct-horse"}).status_code == 200
-    assert client.post("/api/setup", json={"password": "another-one"}).status_code == 409
+    assert client.post("/api/setup", json={"password": "another-one"}).json()["code"] == "already_set_up"
 
 
 def test_env_password(client, monkeypatch):
@@ -57,35 +83,38 @@ def test_env_password(client, monkeypatch):
     assert client.post("/api/login", json={"password": "from-zenith-env"}).status_code == 200
 
 
-def test_settings_mask_and_keep_key(client):
+def test_settings_mask_keep_key_and_rpm(client):
     setup_admin(client)
     s = client.get("/api/settings").json()
     assert s["has_api_key"] and "sk-test" not in json.dumps(s)
-    client.put("/api/settings", json={"llm_api_key": "", "llm_model": "mock-2"})
-    assert client.get("/api/settings").json()["llm_model"] == "mock-2"
+    client.put("/api/settings", json={"llm_api_key": "", "llm_model": "mock-2", "max_rpm": "10"})
+    s = client.get("/api/settings").json()
+    assert s["llm_model"] == "mock-2" and s["max_rpm"] == 10
+    r = client.put("/api/settings", json={"max_rpm": "lots"})
+    assert r.status_code == 400 and r.json()["code"] == "rpm_invalid"
     assert client.post("/api/settings/test").json()["ok"] is True
+
+
+def test_rotate_key(client):
+    old = setup_admin(client)
+    new = client.post("/api/team-key/rotate").json()["team_key"]
+    assert new != old
+    assert imme(client, old, ["x y"]).status_code == 401
+    assert imme(client, new, ["x y"]).status_code == 200
 
 
 def test_immersive_endpoint_requires_key(client):
     setup_admin(client)
-    r = client.post("/imme", json={"source_lang": "en", "target_lang": "zh-CN", "text_list": ["hi"]})
-    assert r.status_code == 401
-    r = client.post("/imme?token=wrong", json={"text_list": ["hi"]})
-    assert r.status_code == 401
+    r = client.post("/imme", json={"text_list": ["hi"]})
+    assert r.status_code == 401 and r.json()["error"]["code"] == "wrong_team_key"
 
 
+# ------------------------------------------------------------------ glossary and memory
 def test_immersive_glossary_and_cache(client):
     key = setup_admin(client)
     client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
-    body = {
-        "source_lang": "auto",
-        "target_lang": "zh-CN",
-        "text_list": ["The census date is in week 4.", "Fees are due before the Census Date.", "123", "  "],
-    }
-    r = client.post(f"/imme?token={key}", json=body)
-    assert r.status_code == 200, r.text
-    out = r.json()["translations"]
-    assert len(out) == 4
+    texts = ["The census date is in week 4.", "Fees are due before the Census Date.", "123", "  "]
+    out = imme(client, key, texts).json()["translations"]
     assert out[0]["text"] == "[ZH] The 退课截止日 is in week 4."
     assert "退课截止日" in out[1]["text"]
     assert out[2]["text"] == "123" and out[3]["text"] == "  "
@@ -93,14 +122,15 @@ def test_immersive_glossary_and_cache(client):
     assert mock_llm.app.state.calls == 1  # two paragraphs, one batched call
 
     # A teammate translates the same page: served from shared memory, no new upstream call.
-    r = client.post("/imme", json=body, headers={"Authorization": f"Bearer {key}"})
-    assert r.json()["translations"] == out
+    again = client.post("/imme", json={"target_lang": "zh-CN", "text_list": texts},
+                        headers={"Authorization": f"Bearer {key}"}).json()["translations"]
+    assert [t["text"] for t in again] == [t["text"] for t in out]
     assert mock_llm.app.state.calls == 1
 
-    # Changing the term invalidates exactly the paragraphs that use it.
+    # Changing the term re-translates exactly the paragraphs that use it.
     term_id = client.get("/api/glossary").json()["terms"][0]["id"]
     client.put(f"/api/glossary/{term_id}", json={"source": "census date", "target": "人口普查截止日"})
-    out2 = client.post(f"/imme?token={key}", json=body).json()["translations"]
+    out2 = imme(client, key, texts).json()["translations"]
     assert "人口普查截止日" in out2[0]["text"]
     assert mock_llm.app.state.calls == 2
 
@@ -108,89 +138,254 @@ def test_immersive_glossary_and_cache(client):
     assert stats["items"] == 6 and stats["cache_hits"] == 2
     assert stats["glossary_compliance"] == 1.0
     assert stats["top_terms"][0]["source"] == "census date"
+    assert stats["llm_calls"] == 2 and stats["calls_last_hour"] == 2
 
 
-def test_batch_falls_back_when_model_breaks_json(client):
+def test_plurals_hyphens_and_spaces_match(client):
     key = setup_admin(client)
-    mock_llm.app.state.break_json = True
-    r = client.post(f"/imme?token={key}", json={"target_lang": "zh-CN", "text_list": ["one apple", "two pears"]})
-    assert r.json()["translations"][1]["text"] == "[ZH] two pears"
-    assert mock_llm.app.state.calls == 3  # failed batch + 2 single calls
-
-
-def test_openai_proxy_injects_glossary_and_caches(client):
-    key = setup_admin(client)
-    client.post("/api/glossary", json={"source": "tutorial", "target": "辅导课"})
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": "You are a professional, authentic machine translation engine."},
-            {"role": "user", "content": "Translate the following source text to Simplified Chinese: Tutorial starts in week 2."},
-        ],
-    }
-    h = {"Authorization": f"Bearer {key}"}
-    r = client.post("/v1/chat/completions", json=body, headers=h)
-    assert r.status_code == 200, r.text
-    assert "辅导课" in r.json()["choices"][0]["message"]["content"]
-    assert r.headers["x-glossa-cache"] == "miss"
-    sent_system = mock_llm.app.state.last_messages[0]["content"]
-    assert sent_system.startswith("You are a professional") and '"tutorial" → "辅导课"' in sent_system
-
-    r = client.post("/v1/chat/completions", json=body, headers=h)
-    assert r.headers["x-glossa-cache"] == "hit" and mock_llm.app.state.calls == 1
-
-    r = client.post("/v1/chat/completions", json={**body, "stream": True}, headers=h)
-    lines = [l for l in r.text.splitlines() if l.startswith("data: ")]
-    assert lines[-1] == "data: [DONE]"
-    assert "辅导课" in json.loads(lines[0][6:])["choices"][0]["delta"]["content"]
-
-
-def test_glossary_language_scoping(client):
-    key = setup_admin(client)
-    client.post("/api/glossary", json={"source": "lecture", "target": "講義", "target_lang": "ja"})
-    out = client.post(f"/imme?token={key}", json={"target_lang": "zh-CN", "text_list": ["The lecture"]}).json()
-    assert "講義" not in out["translations"][0]["text"]
-    out = client.post(f"/imme?token={key}", json={"target_lang": "ja", "text_list": ["The lecture"]}).json()
-    assert "講義" in out["translations"][0]["text"]
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    client.post("/api/glossary", json={"source": "society", "target": "社团"})
+    texts = [
+        "Census dates are listed below.",
+        "The census-date rule applies.",
+        "The census date is Sunday.",
+        "The census date's deadline is fixed.",
+        "Two societies merged.",
+    ]
+    items = client.post("/api/translate", json={"text": "\n".join(texts)}).json()["items"]
+    for item in items:
+        assert item["terms"], item["source"]
+        assert all(t["applied"] for t in item["terms"]), item
+    assert "社团" in items[4]["text"]
 
 
 def test_word_boundaries(client):
     key = setup_admin(client)
     client.post("/api/glossary", json={"source": "term", "target": "学期"})
-    out = client.post(f"/imme?token={key}", json={"target_lang": "zh-CN", "text_list": ["Determine the terminal state"]}).json()
+    out = imme(client, key, ["Determine the terminal state"]).json()
     assert "学期" not in out["translations"][0]["text"]
 
 
+def test_glossary_language_scoping(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "lecture", "target": "講義", "target_lang": "ja"})
+    assert "講義" not in imme(client, key, ["The lecture"], "zh-CN").json()["translations"][0]["text"]
+    assert "講義" in imme(client, key, ["The lecture"], "ja").json()["translations"][0]["text"]
+
+
+def test_exact_term_paragraphs_skip_the_ai(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "Key dates", "target": "重要日期"})
+    out = imme(client, key, ["Key dates", " Key dates: "]).json()["translations"]
+    assert [t["text"] for t in out] == ["重要日期", "重要日期:"]
+    assert mock_llm.app.state.calls == 0
+    assert client.get("/api/stats").json()["glossary_direct"] == 2
+
+
+def test_glossary_compliance_retry(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    mock_llm.app.state.ignore_glossary = True  # the model ignores the glossary the first time
+    out = imme(client, key, ["The census date is Sunday."]).json()["translations"]
+    assert "退课截止日" in out[0]["text"]
+    assert mock_llm.app.state.calls == 2
+
+
+def test_batch_split_when_model_breaks_format(client):
+    key = setup_admin(client)
+    mock_llm.app.state.break_format = True
+    out = imme(client, key, ["one apple", "two pears"]).json()["translations"]
+    assert [t["text"] for t in out] == ["[ZH] one apple", "[ZH] two pears"]
+    assert mock_llm.app.state.calls == 3  # broken batch, then each half on its own
+
+
+# ------------------------------------------------------------------ OpenAI route
+def test_openai_paragraph_mode_caches_per_paragraph(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    h = {"Authorization": f"Bearer {key}"}
+    r = client.post("/v1/chat/completions", json=immersive_prompt(["Student News", "Census dates", "Events"]), headers=h)
+    assert r.status_code == 200, r.text
+    content = r.json()["choices"][0]["message"]["content"]
+    # "Census dates" is only a glossary term (plural), so it is answered from the glossary directly.
+    assert content == "[[p0]]\n[ZH] Student News\n[[p1]]\n退课截止日\n[[p2]]\n[ZH] Events\n[[source_end]]"
+    assert r.headers["x-glossa-cache"] == "partial"  # one of three needed no AI
+    assert mock_llm.app.state.calls == 1
+
+    # Same paragraphs, grouped differently (another teammate, another scroll position): all from memory.
+    r = client.post("/v1/chat/completions", json=immersive_prompt(["Events", "Student News"]), headers=h)
+    assert r.json()["choices"][0]["message"]["content"] == "[[p0]]\n[ZH] Events\n[[p1]]\n[ZH] Student News\n[[source_end]]"
+    assert r.headers["x-glossa-cache"] == "hit" and mock_llm.app.state.calls == 1
+
+    # A mix of known and new paragraphs only sends the new one.
+    r = client.post("/v1/chat/completions", json=immersive_prompt(["Events", "Graduation"]), headers=h)
+    assert r.headers["x-glossa-cache"] == "partial" and mock_llm.app.state.batch_sizes[-1] == 1
+
+    # Try it shares the same memory.
+    item = client.post("/api/translate", json={"text": "Student News"}).json()["items"][0]
+    assert item["cached"] is True
+    recent = client.get("/api/stats").json()["recent"]
+    assert recent[-1]["items"] == 3  # real paragraph count, not 1 per request
+
+
+def test_openai_stream_and_fallback_format(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "tutorial", "target": "辅导课"})
+    h = {"Authorization": f"Bearer {key}"}
+    plain = {
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": IMMERSIVE_SYSTEM},
+            {"role": "user", "content": "Translate the following source text to Simplified Chinese: Tutorial starts in week 2."},
+        ],
+    }
+    r = client.post("/v1/chat/completions", json=plain, headers=h)
+    assert "辅导课" in r.json()["choices"][0]["message"]["content"]
+    sent_system = mock_llm.app.state.last_messages[0]["content"]
+    assert sent_system.startswith("You are a professional") and '"tutorial" → "辅导课"' in sent_system
+    r = client.post("/v1/chat/completions", json=plain, headers=h)
+    assert r.headers["x-glossa-cache"] == "hit" and mock_llm.app.state.calls == 1
+
+    r = client.post("/v1/chat/completions", json={**immersive_prompt(["Hello"]), "stream": True}, headers=h)
+    lines = [l for l in r.text.splitlines() if l.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    assert "[ZH] Hello" in json.loads(lines[0][6:])["choices"][0]["delta"]["content"]
+
+
+# ------------------------------------------------------------------ coalescing, limits, retries
+def test_concurrent_requests_are_merged_into_one_call(client, monkeypatch):
+    key = setup_admin(client)
+    monkeypatch.setattr(engine, "COALESCE_SECONDS", 0.4)
+    h = {"Authorization": f"Bearer {key}"}
+    with ThreadPoolExecutor(3) as pool:
+        futures = [
+            pool.submit(client.post, "/v1/chat/completions", json=immersive_prompt(["Alpha", "Beta"]), headers=h),
+            pool.submit(client.post, "/v1/chat/completions", json=immersive_prompt(["Gamma", "Delta"]), headers=h),
+            pool.submit(client.post, "/v1/chat/completions", json=immersive_prompt(["Alpha", "Epsilon"]), headers=h),
+        ]
+        results = [f.result() for f in futures]
+    assert all(r.status_code == 200 for r in results)
+    assert mock_llm.app.state.calls == 1
+    assert mock_llm.app.state.batch_sizes == [5]  # "Alpha" was needed twice but sent once
+
+
+def test_rate_limit_retry_uses_provider_delay(client):
+    key = setup_admin(client)
+    mock_llm.app.state.fail_queue = [(429, mock_llm.gemini_429("0.2s"))]
+    r = imme(client, key, ["Hello there"])
+    assert r.status_code == 200 and r.json()["translations"][0]["text"] == "[ZH] Hello there"
+    assert mock_llm.app.state.calls == 2
+    stats = client.get("/api/stats").json()
+    assert stats["failed_calls_last_hour"] == 1 and stats["errors_24h"] == 0
+
+
+def test_rate_limit_exhausted_is_reported_as_429(client):
+    key = setup_admin(client)
+    mock_llm.app.state.fail_queue = [(429, mock_llm.gemini_429("0.1s"))] * 3
+    r = imme(client, key, ["Hello there"])
+    assert r.status_code == 429 and r.headers.get("retry-after") == "1"
+    body = r.json()
+    assert body["code"] == "upstream_rate_limit"
+    assert "Quota exceeded for metric" in body["raw"]  # full provider message, not cut off
+    stats = client.get("/api/stats").json()
+    assert stats["errors_24h"] == 1
+    assert stats["recent"][0]["error_code"] == "upstream_rate_limit"
+    assert "limit: 15" in stats["recent"][0]["error"]
+
+
+def test_outage_is_retried(client):
+    key = setup_admin(client)
+    mock_llm.app.state.fail_queue = [(503, {"error": {"message": "The model is overloaded."}})]
+    r = imme(client, key, ["Hello again"])
+    assert r.status_code == 200 and mock_llm.app.state.calls == 2
+
+
+def test_failed_batch_does_not_sink_the_others(client, monkeypatch):
+    setup_admin(client)
+    monkeypatch.setattr(engine, "MAX_BATCH_ITEMS", 2)
+    mock_llm.app.state.fail_queue = [(400, {"error": {"message": "bad request"}})]  # not retryable
+    r = client.post("/api/translate", json={"text": "one\ntwo\nthree\nfour"})
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert sum(1 for i in items if i["error_code"]) == 2
+    assert sum(1 for i in items if i["text"].startswith("[ZH]")) == 2
+    # Retrying only sends the two that failed.
+    items = client.post("/api/translate", json={"text": "one\ntwo\nthree\nfour"}).json()["items"]
+    assert all(i["text"].startswith("[ZH]") for i in items)
+    assert sum(1 for i in items if i["cached"]) == 2
+
+
+def test_wrong_key_and_model_errors_have_codes(client):
+    setup_admin(client)
+    client.put("/api/settings", json={"llm_model": "no-such-model"})
+    r = client.post("/api/translate", json={"text": "Something new"})
+    assert r.status_code == 502 and r.json()["code"] == "upstream_not_found"
+    client.put("/api/settings", json={"llm_model": "mock-1", "llm_api_key": "sk-wrong"})
+    r = client.post("/api/translate", json={"text": "Something else"})
+    assert r.status_code == 502 and r.json()["code"] == "upstream_auth"
+    client.put("/api/settings", json={"llm_api_key": "sk-test"})
+    assert client.post("/api/translate", json={"text": "Something else"}).status_code == 200
+
+
+def test_rate_limiter_spaces_calls():
+    now = [0.0]
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    async def go():
+        lim = engine.RateLimiter(clock=lambda: now[0], sleep=fake_sleep)
+        for _ in range(3):
+            await lim.acquire(2)
+        lim.pause_for(5)
+        await lim.acquire(0)
+
+    asyncio.run(go())
+    assert slept[0] == pytest.approx(60.05) and slept[1] == pytest.approx(5)
+
+
+def test_parse_google_list_error():
+    resp = httpx.Response(429, json=mock_llm.gemini_429("17s"))
+    message, retry_after, raw = engine.parse_error_body(resp)
+    assert message.startswith("You exceeded your current quota") and retry_after == 17.0
+    assert "RESOURCE_EXHAUSTED" in raw
+
+
+def test_parse_paragraph_prompt():
+    text = "Translate to Simplified Chinese Language:\n\n[[p0]]\n Student News \n[[p1]]\n Events \n[[source_end]] "
+    assert engine.parse_paragraph_prompt(text) == [(0, "Student News"), (1, "Events")]
+    assert engine.parse_paragraph_prompt("Translate this: hello") is None
+
+
+# ------------------------------------------------------------------ misc
 def test_csv_roundtrip_and_suggest(client):
     setup_admin(client)
     r = client.post("/api/glossary/import", json={"csv": "source,target,note\nWAM,加权平均分,UNSW\nZID,学号,\n,empty,\n"})
     assert r.json() == {"added": 2, "skipped": 1}
-    csv_text = client.get("/api/glossary/export").text
-    assert "WAM,加权平均分,zh-CN,UNSW,0" in csv_text
+    assert "WAM,加权平均分,zh-CN,UNSW,0" in client.get("/api/glossary/export").text
     sugg = client.post("/api/glossary/suggest", json={"text": "The census date for this term is Sunday of week 4."}).json()
     assert sugg["terms"][0]["source"] == "census date"
 
 
-def test_dashboard_translate_and_errors(client):
-    setup_admin(client)
-    r = client.post("/api/translate", json={"text": "Hello world\n\nSecond line"})
-    items = r.json()["items"]
-    assert [i["skipped"] for i in items] == [False, True, False]
-    r = client.post("/api/translate", json={"text": "Hello world"})
-    assert r.json()["items"][0]["cached"] is True
-    # Wrong upstream key -> clear error, logged
-    client.put("/api/settings", json={"llm_api_key": "sk-wrong"})
-    r = client.post("/api/translate", json={"text": "Something new"})
-    assert r.status_code == 502 and "Incorrect API key" in r.json()["detail"]
-    assert client.get("/api/stats").json()["errors"] == 1
-
-
-def test_rotate_key(client):
-    old = setup_admin(client)
-    new = client.post("/api/team-key/rotate").json()["team_key"]
-    assert new != old
-    assert client.post(f"/imme?token={old}", json={"text_list": ["x y"]}).status_code == 401
-    assert client.post(f"/imme?token={new}", json={"text_list": ["x y"]}).status_code == 200
+def test_upgrade_from_v1_database(tmp_path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, endpoint TEXT NOT NULL, "
+        "items INTEGER NOT NULL DEFAULT 0, cache_hits INTEGER NOT NULL DEFAULT 0, llm_calls INTEGER NOT NULL DEFAULT 0, "
+        "chars_in INTEGER NOT NULL DEFAULT 0, chars_cached INTEGER NOT NULL DEFAULT 0, "
+        "terms_matched INTEGER NOT NULL DEFAULT 0, terms_applied INTEGER NOT NULL DEFAULT 0, "
+        "ms INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 1, error TEXT NOT NULL DEFAULT '');"
+        "INSERT INTO events (ts, endpoint, items) VALUES (1, 'openai', 1);"
+    )
+    con.commit()
+    con.close()
+    database = dbmod.Database(path)
+    database.log_event(endpoint="openai", items=3, glossary_direct=1, error_code="")
+    rows = database.query("SELECT items, glossary_direct FROM events ORDER BY id")
+    assert rows == [{"items": 1, "glossary_direct": 0}, {"items": 3, "glossary_direct": 1}]
 
 
 def test_healthz_and_index(client):

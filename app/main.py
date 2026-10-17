@@ -10,7 +10,8 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,20 +31,20 @@ from .auth import (
 from .db import Database, get_db
 from .engine import (
     PRESETS,
-    LLMError,
-    chat_completion,
+    call_once,
     detected_lang,
     load_settings,
     proxy_chat,
     suggest_terms,
     translate_texts,
 )
+from .errors import AppError, LLMError
 from .languages import LANG_NAMES, canon
 
 STATIC_DIR = Path(__file__).parent / "static"
 SETTING_KEYS = {
     "llm_base_url", "llm_api_key", "llm_model", "temperature", "default_target_lang",
-    "style_guide", "price_per_m_tokens", "team_name", "provider",
+    "style_guide", "price_per_m_tokens", "team_name", "provider", "max_rpm",
 }
 
 
@@ -70,6 +71,19 @@ def mask(key: str) -> str:
     return key[:3] + "…" + key[-4:] if len(key) > 10 else "•" * len(key)
 
 
+def error_body(code: str, message: str, params: dict | None = None, raw: str = "") -> dict:
+    """OpenAI-style `error` for API clients, plus `code`/`params` for the dashboard's translations."""
+    body = {
+        "error": {"message": message, "type": "glossa_error", "code": code},
+        "detail": message,
+        "code": code,
+        "params": params or {},
+    }
+    if raw and raw != message:
+        body["raw"] = raw[:4000]
+    return body
+
+
 def create_app() -> FastAPI:
     db = get_db()
     ensure_secrets(db)
@@ -91,12 +105,21 @@ def create_app() -> FastAPI:
         allow_credentials=False,
     )
 
+    @app.exception_handler(AppError)
+    async def app_error_handler(_: Request, exc: AppError):
+        return JSONResponse(status_code=exc.status, content=error_body(exc.code, exc.message, exc.params))
+
     @app.exception_handler(LLMError)
     async def llm_error_handler(_: Request, exc: LLMError):
-        return JSONResponse(
-            status_code=exc.status,
-            content={"error": {"message": exc.message, "type": "glossa_error"}, "detail": exc.message},
-        )
+        headers = {}
+        if exc.status == 429 and exc.retry_after:
+            headers["Retry-After"] = str(max(1, int(round(exc.retry_after))))
+        return JSONResponse(status_code=exc.status, content=error_body(exc.code, exc.message, raw=exc.raw),
+                            headers=headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(_: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=400, content=error_body("bad_request", "The request body is not valid."))
 
     # ------------------------------------------------------------------ pages
     @app.get("/", include_in_schema=False)
@@ -110,6 +133,15 @@ def create_app() -> FastAPI:
         get_db().query_one("SELECT 1 AS ok")
         return {"ok": True, "version": __version__}
 
+    async def read_json(request: Request) -> dict:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise AppError(400, "bad_request", "Body must be JSON.")
+        if not isinstance(body, dict):
+            raise AppError(400, "bad_request", "Body must be a JSON object.")
+        return body
+
     # ------------------------------------------------------------------ translation endpoints
     @app.post("/imme")
     @app.post("/translate")
@@ -117,18 +149,17 @@ def create_app() -> FastAPI:
         """Immersive Translate 'custom API' format:
         {source_lang, target_lang, text_list} -> {translations: [{detected_source_lang, text}]}"""
         require_team_key(request, db)
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Body must be JSON.")
+        body = await read_json(request)
         text_list = body.get("text_list")
         if isinstance(text_list, str):
             text_list = [text_list]
         if not isinstance(text_list, list) or not all(isinstance(t, str) for t in text_list):
-            raise HTTPException(400, "'text_list' must be an array of strings.")
+            raise AppError(400, "bad_request", "'text_list' must be an array of strings.")
         if len(text_list) > 500:
-            raise HTTPException(413, "Too many paragraphs in one request (max 500).")
+            raise AppError(413, "too_many_paragraphs", "Too many paragraphs in one request (max 500).")
         outcome = await translate_texts(db, text_list, body.get("target_lang"), "immersive")
+        if outcome.first_error:
+            raise outcome.first_error  # finished paragraphs are already in memory for the retry
         src = body.get("source_lang")
         return {
             "translations": [
@@ -146,22 +177,20 @@ def create_app() -> FastAPI:
     @app.post("/v1/chat/completions")
     async def openai_proxy(request: Request, db: Database = Depends(db_dep)):
         require_team_key(request, db)
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Body must be JSON.")
-        content, model, cached = await proxy_chat(db, body)
+        body = await read_json(request)
+        result = await proxy_chat(db, body)
         cid = "chatcmpl-glossa-" + uuid.uuid4().hex[:20]
         created = int(time.time())
-        headers = {"X-Glossa-Cache": "hit" if cached else "miss"}
+        headers = {"X-Glossa-Cache": result.cache}
         if body.get("stream"):
             def sse():
                 first = {
-                    "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}],
+                    "id": cid, "object": "chat.completion.chunk", "created": created, "model": result.model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": result.content},
+                                 "finish_reason": None}],
                 }
                 last = {
-                    "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "id": cid, "object": "chat.completion.chunk", "created": created, "model": result.model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
@@ -174,9 +203,9 @@ def create_app() -> FastAPI:
                 "id": cid,
                 "object": "chat.completion",
                 "created": created,
-                "model": model,
+                "model": result.model,
                 "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    {"index": 0, "message": {"role": "assistant", "content": result.content}, "finish_reason": "stop"}
                 ],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             },
@@ -200,10 +229,10 @@ def create_app() -> FastAPI:
     @app.post("/api/setup")
     async def setup(request: Request, payload: dict = Body(...), db: Database = Depends(db_dep)):
         if not setup_required(db):
-            raise HTTPException(409, "Glossa is already set up.")
+            raise AppError(409, "already_set_up", "Glossa is already set up.")
         password = str(payload.get("password", ""))
         if len(password) < 8:
-            raise HTTPException(400, "Use at least 8 characters.")
+            raise AppError(400, "password_too_short", "Use at least 8 characters.", min=8)
         db.set_setting("admin_password_hash", hash_password(password))
         if payload.get("team_name"):
             db.set_setting("team_name", str(payload["team_name"])[:80])
@@ -214,10 +243,10 @@ def create_app() -> FastAPI:
     async def login(request: Request, payload: dict = Body(...), db: Database = Depends(db_dep)):
         cid = client_id(request)
         if LIMITER.blocked(cid):
-            raise HTTPException(429, "Too many attempts. Wait a few minutes and try again.")
+            raise AppError(429, "too_many_attempts", "Too many attempts. Wait a few minutes and try again.")
         if not check_password(db, str(payload.get("password", ""))):
             LIMITER.fail(cid)
-            raise HTTPException(401, "Wrong password.")
+            raise AppError(401, "wrong_password", "Wrong password.")
         LIMITER.reset(cid)
         request.session["admin"] = True
         return {"ok": True}
@@ -243,7 +272,7 @@ def create_app() -> FastAPI:
             "configured": s.configured,
             "model": s.model,
             "default_target_lang": s.default_target_lang,
-            "stats": compute_stats(db, s.price_per_m_tokens),
+            "stats": compute_stats(db, s.price_per_m_tokens, s.max_rpm),
         }
 
     @app.post("/api/team-key/rotate", dependencies=[Depends(admin_dep)])
@@ -265,6 +294,7 @@ def create_app() -> FastAPI:
             "default_target_lang": s.default_target_lang,
             "style_guide": s.style_guide,
             "price_per_m_tokens": s.price_per_m_tokens,
+            "max_rpm": s.max_rpm,
             "team_name": db.get_setting("team_name", "") or "",
             "presets": PRESETS,
             "languages": LANG_NAMES,
@@ -284,14 +314,23 @@ def create_app() -> FastAPI:
                 try:
                     t = float(value)
                 except ValueError:
-                    raise HTTPException(400, "Temperature must be a number.")
+                    raise AppError(400, "temperature_invalid", "Temperature must be a number between 0 and 2.")
                 if not 0 <= t <= 2:
-                    raise HTTPException(400, "Temperature must be between 0 and 2.")
+                    raise AppError(400, "temperature_invalid", "Temperature must be a number between 0 and 2.")
             if key == "price_per_m_tokens" and value:
                 try:
-                    float(value)
+                    if float(value) < 0:
+                        raise ValueError
                 except ValueError:
-                    raise HTTPException(400, "Price must be a number.")
+                    raise AppError(400, "price_invalid", "Price must be a number of 0 or more.")
+            if key == "max_rpm" and value:
+                try:
+                    n = int(float(value))
+                except ValueError:
+                    raise AppError(400, "rpm_invalid", "Requests per minute must be a whole number of 0 or more.")
+                if n < 0:
+                    raise AppError(400, "rpm_invalid", "Requests per minute must be a whole number of 0 or more.")
+                value = str(n)
             db.set_setting(key, value[:20000])
         return await get_settings(db)
 
@@ -299,8 +338,8 @@ def create_app() -> FastAPI:
     async def test_settings(db: Database = Depends(db_dep)):
         s = load_settings(db)
         started = time.perf_counter()
-        reply = await chat_completion(
-            s, [{"role": "user", "content": "Translate to Simplified Chinese, reply with the translation only: Good morning"}]
+        reply = await call_once(
+            db, [{"role": "user", "content": "Translate to Simplified Chinese, reply with the translation only: Good morning"}]
         )
         return {"ok": True, "reply": reply[:200], "ms": int((time.perf_counter() - started) * 1000), "model": s.model}
 
@@ -309,9 +348,9 @@ def create_app() -> FastAPI:
         source = str(payload.get("source", "")).strip()
         target = str(payload.get("target", "")).strip()
         if not source or not target:
-            raise HTTPException(400, "Both the term and its translation are required.")
+            raise AppError(400, "term_required", "Both the term and its translation are required.")
         if len(source) > 200 or len(target) > 200:
-            raise HTTPException(400, "Terms are limited to 200 characters.")
+            raise AppError(400, "term_too_long", "Terms are limited to 200 characters.", max=200)
         lang = canon(payload.get("target_lang") or load_settings(db).default_target_lang)
         return {
             "source": source,
@@ -337,7 +376,7 @@ def create_app() -> FastAPI:
             try:
                 db.upsert_term(**clean_term(item, db))
                 added += 1
-            except HTTPException:
+            except AppError:
                 continue
         return {"added": added}
 
@@ -349,16 +388,16 @@ def create_app() -> FastAPI:
             (t["source"], t["target_lang"], term_id),
         )
         if clash:
-            raise HTTPException(409, "That term already exists for this language.")
+            raise AppError(409, "term_exists", "That term already exists for this language.")
         row = db.update_term(term_id, **t)
         if not row:
-            raise HTTPException(404, "Term not found.")
+            raise AppError(404, "term_not_found", "Term not found.")
         return row
 
     @app.delete("/api/glossary/{term_id}", dependencies=[Depends(admin_dep)])
     async def remove_term(term_id: int, db: Database = Depends(db_dep)):
         if not db.delete_term(term_id):
-            raise HTTPException(404, "Term not found.")
+            raise AppError(404, "term_not_found", "Term not found.")
         return {"ok": True}
 
     @app.get("/api/glossary/export", dependencies=[Depends(admin_dep)])
@@ -378,7 +417,7 @@ def create_app() -> FastAPI:
     async def import_glossary(payload: dict = Body(...), db: Database = Depends(db_dep)):
         text = str(payload.get("csv", "")).lstrip("﻿")
         if not text.strip():
-            raise HTTPException(400, "The file is empty.")
+            raise AppError(400, "file_empty", "The file is empty.")
         rows = list(csv.reader(io.StringIO(text)))
         if rows and [c.strip().lower() for c in rows[0][:2]] == ["source", "target"]:
             header = [c.strip().lower() for c in rows[0]]
@@ -392,7 +431,7 @@ def create_app() -> FastAPI:
             try:
                 db.upsert_term(**clean_term(item, db))
                 added += 1
-            except HTTPException:
+            except AppError:
                 skipped += 1
         return {"added": added, "skipped": skipped}
 
@@ -400,7 +439,7 @@ def create_app() -> FastAPI:
     async def suggest(payload: dict = Body(...), db: Database = Depends(db_dep)):
         text = str(payload.get("text", "")).strip()
         if len(text) < 20:
-            raise HTTPException(400, "Paste a longer sample (a paragraph or more).")
+            raise AppError(400, "sample_too_short", "Paste a longer sample (a paragraph or more).")
         return {"terms": await suggest_terms(db, text, payload.get("target_lang"))}
 
     # ------------------------------------------------------------------ try it / cache / stats
@@ -408,17 +447,25 @@ def create_app() -> FastAPI:
     async def try_translate(payload: dict = Body(...), db: Database = Depends(db_dep)):
         text = str(payload.get("text", ""))
         if not text.strip():
-            raise HTTPException(400, "Type or paste something to translate.")
+            raise AppError(400, "text_required", "Type or paste something to translate.")
         if len(text) > 20000:
-            raise HTTPException(413, "Keep the sample under 20,000 characters.")
+            raise AppError(413, "text_too_long", "Keep the sample under 20,000 characters.", max=20000)
         paragraphs = text.split("\n")
         started = time.perf_counter()
         outcome = await translate_texts(db, paragraphs, payload.get("target_lang"), "dashboard")
+        err = outcome.first_error
+        if err and all(i.error or i.skipped for i in outcome.items):
+            raise err  # nothing came back at all
         return {
             "ms": int((time.perf_counter() - started) * 1000),
             "llm_calls": outcome.llm_calls,
+            "error_code": err.code if err else "",
+            "error_raw": err.raw[:2000] if err else "",
             "items": [
-                {"source": i.source, "text": i.text, "cached": i.cached, "skipped": i.skipped, "terms": i.terms}
+                {
+                    "source": i.source, "text": i.text, "cached": i.cached, "direct": i.direct,
+                    "skipped": i.skipped, "terms": i.terms, "error_code": i.error.code if i.error else "",
+                }
                 for i in outcome.items
             ],
         }
@@ -429,7 +476,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/stats", dependencies=[Depends(admin_dep)])
     async def stats(db: Database = Depends(db_dep)):
-        return compute_stats(db, load_settings(db).price_per_m_tokens)
+        s = load_settings(db)
+        return compute_stats(db, s.price_per_m_tokens, s.max_rpm)
 
     @app.get("/robots.txt", include_in_schema=False)
     async def robots():
@@ -438,34 +486,50 @@ def create_app() -> FastAPI:
     return app
 
 
-def compute_stats(db: Database, price_per_m: float) -> dict:
+def compute_stats(db: Database, price_per_m: float, max_rpm: int) -> dict:
     tot = db.query_one(
         "SELECT COUNT(*) AS requests, COALESCE(SUM(items),0) AS items, COALESCE(SUM(cache_hits),0) AS cache_hits, "
-        "COALESCE(SUM(llm_calls),0) AS llm_calls, COALESCE(SUM(chars_in),0) AS chars_in, "
-        "COALESCE(SUM(chars_cached),0) AS chars_cached, COALESCE(SUM(terms_matched),0) AS terms_matched, "
-        "COALESCE(SUM(terms_applied),0) AS terms_applied, COALESCE(SUM(1 - ok),0) AS errors FROM events"
+        "COALESCE(SUM(glossary_direct),0) AS glossary_direct, "
+        "COALESCE(SUM(chars_in),0) AS chars_in, COALESCE(SUM(chars_cached),0) AS chars_cached, "
+        "COALESCE(SUM(terms_matched),0) AS terms_matched, COALESCE(SUM(terms_applied),0) AS terms_applied "
+        "FROM events"
     ) or {}
+    now = time.time()
+    errors_24h = (db.query_one("SELECT COUNT(*) AS n FROM events WHERE ok = 0 AND ts >= ?", (now - 86400,)) or {}).get("n", 0)
+    calls = db.query_one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(1 - ok), 0) AS failed FROM upstream_calls WHERE ts >= ?", (now - 3600,)
+    ) or {}
+    peak = db.query_one(
+        "SELECT COALESCE(MAX(n), 0) AS peak FROM (SELECT COUNT(*) AS n FROM upstream_calls WHERE ts >= ? "
+        "GROUP BY CAST(ts / 60 AS INTEGER))",
+        (now - 3600,),
+    ) or {}
+    total_calls = (db.query_one("SELECT COUNT(*) AS n FROM upstream_calls WHERE ok = 1") or {}).get("n", 0)
     items = tot.get("items", 0) or 0
     hits = tot.get("cache_hits", 0) or 0
+    direct = tot.get("glossary_direct", 0) or 0
     matched = tot.get("terms_matched", 0) or 0
     # Rough token estimate: ~4 characters per token for the input, and a similar amount of output.
     tokens_saved = int((tot.get("chars_cached", 0) or 0) / 4 * 2)
-    since = time.time() - 13 * 86400
+    since = now - 13 * 86400
     day_rows = db.query(
-        "SELECT date(ts, 'unixepoch', 'localtime') AS day, SUM(items) AS items, SUM(cache_hits) AS hits "
+        "SELECT date(ts, 'unixepoch', 'localtime') AS day, SUM(items) AS items, "
+        "SUM(cache_hits) + SUM(glossary_direct) AS hits "
         "FROM events WHERE ts >= ? GROUP BY day ORDER BY day",
         (since - (since % 86400),),
     )
     by_day = {r["day"]: r for r in day_rows}
     days = []
     for n in range(13, -1, -1):
-        d = time.strftime("%Y-%m-%d", time.localtime(time.time() - n * 86400))
+        d = time.strftime("%Y-%m-%d", time.localtime(now - n * 86400))
         r = by_day.get(d, {})
         days.append({"day": d, "items": r.get("items", 0) or 0, "hits": r.get("hits", 0) or 0})
     recent = db.query(
-        "SELECT ts, endpoint, items, cache_hits, llm_calls, terms_matched, ms, ok, error "
+        "SELECT ts, endpoint, items, cache_hits, glossary_direct, llm_calls, terms_matched, ms, ok, error, error_code "
         "FROM events ORDER BY id DESC LIMIT 12"
     )
+    for r in recent:
+        r["error"] = (r.get("error") or "")[:1500]
     top_terms = db.query(
         "SELECT source, target, target_lang, hit_count FROM glossary WHERE hit_count > 0 "
         "ORDER BY hit_count DESC LIMIT 6"
@@ -476,14 +540,19 @@ def compute_stats(db: Database, price_per_m: float) -> dict:
         "requests": tot.get("requests", 0),
         "items": items,
         "cache_hits": hits,
-        "hit_rate": round(hits / items, 4) if items else 0,
-        "llm_calls": tot.get("llm_calls", 0),
-        "errors": tot.get("errors", 0),
+        "glossary_direct": direct,
+        "hit_rate": round((hits + direct) / items, 4) if items else 0,
+        "llm_calls": total_calls,
+        "errors_24h": errors_24h,
         "terms_matched": matched,
         "terms_applied": tot.get("terms_applied", 0),
         "glossary_compliance": round((tot.get("terms_applied", 0) or 0) / matched, 4) if matched else None,
         "tokens_saved_est": tokens_saved,
         "usd_saved_est": round(tokens_saved * price_per_m / 1_000_000, 4),
+        "calls_last_hour": calls.get("n", 0),
+        "failed_calls_last_hour": calls.get("failed", 0),
+        "peak_rpm_last_hour": peak.get("peak", 0),
+        "max_rpm": max_rpm,
         "glossary_count": glossary_count,
         "cache_entries": cache_count,
         "days": days,

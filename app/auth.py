@@ -9,9 +9,10 @@ import secrets
 import time
 from collections import defaultdict, deque
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 
 from .db import Database
+from .errors import AppError
 
 
 def env_admin_password() -> str:
@@ -71,15 +72,12 @@ def require_team_key(request: Request, db: Database) -> None:
     token = extract_token(request)
     expected = db.get_setting("team_key") or ""
     if not token or not expected or not hmac.compare_digest(token.encode(), expected.encode()):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing or wrong team key. Copy it from the Glossa dashboard → Connect.",
-        )
+        raise AppError(401, "wrong_team_key", "Missing or wrong team key. Copy it from the Glossa dashboard → Overview.")
 
 
 def require_admin(request: Request) -> None:
     if not request.session.get("admin"):
-        raise HTTPException(status_code=401, detail="Please sign in.")
+        raise AppError(401, "not_signed_in", "Please sign in.")
 
 
 class LoginLimiter:

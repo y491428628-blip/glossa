@@ -7,7 +7,8 @@ Glossa sits between your team's [Immersive Translate](https://immersivetranslate
 - **Team glossary.** Add "census date → 退课截止日" once. Everyone's translations use it from then on, in every page they open.
 - **Shared memory.** When one teammate has translated a paragraph, everyone else gets it instantly from memory instead of paying the AI provider again.
 - **Bring your own AI.** Works with any OpenAI-compatible API (OpenAI, DeepSeek, Gemini, OpenRouter, Groq and more). Your key stays on your server.
-- **Dashboard.** Manage the glossary, let the AI suggest terms from a sample, try translations side by side, and see how much the memory has saved.
+- **Stays under your rate limit.** Paragraphs arriving together are merged into a few AI calls, calls are queued under a requests-per-minute limit you set, and rate-limit or outage errors are retried automatically.
+- **Dashboard in six languages.** English, 简体中文, 繁體中文, 日本語, 한국어 and Tiếng Việt. Manage the glossary, let the AI suggest terms from a sample, try translations side by side, and see how much the memory has saved.
 
 Nobody has to change how they read: teammates keep using Immersive Translate and only change one setting.
 
@@ -29,19 +30,21 @@ Each teammate does this once:
 4. Choose OpenAI as the translation service.
 
 Alternatively, enable Beta features in Immersive Translate's developer settings and add a **Custom API** (自定义 API) service with
-`https://<your-glossa-address>/imme?token=<team key>`. This route caches paragraph by paragraph, so memory works even when pages only share a few sentences.
+`https://<your-glossa-address>/imme?token=<team key>`. Both routes share the same glossary and memory.
 
 ## How it works
 
 ```
-Immersive Translate ──► Glossa ──► your AI provider
-                          │
-                          ├─ glossary: matching terms are added to the prompt as mandatory translations
-                          ├─ memory:   cache keyed on text + language + model + matching glossary entries
-                          └─ stats:    paragraphs, memory hits, glossary compliance, estimated savings
+Immersive Translate ──► Glossa ──────────────────────────────────────────► your AI provider
+                          split [[pN]] paragraphs
+                          ├─ exact glossary term?  answer directly, no AI call
+                          ├─ in shared memory?     answer from memory
+                          └─ otherwise             dispatcher: merge with other pending paragraphs,
+                                                   wait for a slot under the per-minute limit,
+                                                   retry 429/5xx, check glossary terms were used
 ```
 
-Editing a glossary term changes the cache key for exactly the paragraphs that contain it, so those are re-translated with the new term while everything else keeps coming from memory.
+Every paragraph is cached on its own, keyed on text + language + model + the glossary entries it matches. Editing a term re-translates exactly the paragraphs that contain it; plural, possessive, hyphenated and no-break-space forms of a term are matched. Prompts that are not in Immersive Translate's paragraph format are forwarded whole, with the glossary added to the system prompt.
 
 ## API
 
@@ -63,6 +66,7 @@ Settings saved in the dashboard take priority. Environment variables provide the
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API address |
 | `LLM_MODEL` | `gpt-4.1-mini` | Model name |
 | `LLM_API_KEY` | none | Provider API key |
+| `MAX_RPM` | `12` | Requests per minute Glossa sends to the provider; `0` for no limit |
 | `PUBLIC_URL` | request host | Address shown in the setup instructions |
 | `DATA_DIR` | `/data` | Where the SQLite database lives |
 
@@ -79,7 +83,9 @@ To try it without an API key, start the bundled mock provider and point Settings
 uvicorn tests.mock_llm:app --port 9999
 ```
 
-Run the tests with `pip install pytest && pytest`.
+The mock can also simulate rate limits: `curl -X POST "localhost:9999/_fail?count=3&status=429"`.
+
+Run the tests with `pip install pytest && pytest`. Known issues and their fixes are tracked in `ISSUES.md`.
 
 ## Publish your own copy to Zenith
 
