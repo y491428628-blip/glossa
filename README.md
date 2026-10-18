@@ -8,6 +8,8 @@ Glossa sits between your team's [Immersive Translate](https://immersivetranslate
 - **Shared memory.** When one teammate has translated a paragraph, everyone else gets it instantly from memory instead of paying the AI provider again.
 - **Bring your own AI.** Works with any OpenAI-compatible API (OpenAI, DeepSeek, Gemini, OpenRouter, Groq and more). Your key stays on your server.
 - **Stays under your rate limit.** Paragraphs arriving together are merged into a few AI calls, calls are queued under a requests-per-minute limit you set, and rate-limit or outage errors are retried automatically.
+- **Safe to edit.** Very short, everyday or very broad terms need a second click, with examples of what they would change. Every change is in a history with one-click undo. Terms with several meanings can be marked *depends on meaning*: the note tells the AI when the translation applies, and it is never forced.
+- **Teammates can suggest terms.** A page that only needs the team key shows the glossary and takes suggestions; the admin approves each one before it is used.
 - **Dashboard in six languages.** English, 简体中文, 繁體中文, 日本語, 한국어 and Tiếng Việt. Manage the glossary, let the AI suggest terms from a sample, try translations side by side, and see how much the memory has saved.
 
 Nobody has to change how they read: teammates keep using Immersive Translate and only change one setting.
@@ -44,7 +46,11 @@ Immersive Translate ──► Glossa ──────────────�
                                                    retry 429/5xx, check glossary terms were used
 ```
 
-Every paragraph is cached on its own, keyed on text + language + model + the glossary entries it matches. Editing a term re-translates exactly the paragraphs that contain it; plural, possessive, hyphenated and no-break-space forms of a term are matched. Prompts that are not in Immersive Translate's paragraph format are forwarded whole, with the glossary added to the system prompt.
+Every paragraph is cached on its own, keyed on text + language + model + the glossary entries it matches. Editing a term (or its note) re-translates exactly the paragraphs that contain it; plural, possessive, hyphenated and no-break-space forms of a term are matched. Term notes are sent to the AI with the term. Prompts that are not in Immersive Translate's paragraph format are forwarded whole, with the glossary added to the system prompt.
+
+## Teammate suggestions
+
+Overview → **Suggestions from teammates** has a link of the form `https://<your-glossa-address>/suggest#key=<team key>` (the setup message includes it too). Teammates can browse the glossary there and suggest a new term or a better translation. Suggestions wait under **Glossary** until the admin approves or rejects them.
 
 ## API
 
@@ -53,8 +59,10 @@ Every paragraph is cached on its own, keyed on text + language + model + the glo
 | `POST /v1/chat/completions` | `Authorization: Bearer <team key>` | OpenAI-compatible proxy with glossary injection and caching (`stream` supported) |
 | `POST /imme` | `?token=<team key>` or bearer | Immersive Translate custom API: `{source_lang, target_lang, text_list}` → `{translations: [{detected_source_lang, text}]}` |
 | `GET /v1/models` | team key | Lists the configured model |
+| `GET /api/team/glossary` | team key | The glossary, read-only, for the teammate page |
+| `POST /api/team/proposals` | team key | Suggest a term: `{source, target, target_lang, note, name}` (30 per hour per address) |
 | `GET /healthz` | none | Health check |
-| `/api/*` | admin session | Dashboard API (glossary, settings, stats, try-it) |
+| `/api/*` | admin session | Dashboard API (glossary, history and undo, proposals, settings, stats, try-it) |
 
 ## Configuration
 

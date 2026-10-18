@@ -20,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import __version__
 from .auth import (
     LIMITER,
+    LoginLimiter,
     check_password,
     ensure_secrets,
     hash_password,
@@ -28,14 +29,16 @@ from .auth import (
     require_team_key,
     setup_required,
 )
-from .db import Database, get_db
+from .db import Database, HistoryConflict, get_db
 from .engine import (
     PRESETS,
     call_once,
     detected_lang,
     load_settings,
     proxy_chat,
+    static_warnings,
     suggest_terms,
+    term_warnings,
     translate_texts,
 )
 from .errors import AppError, LLMError
@@ -46,6 +49,12 @@ SETTING_KEYS = {
     "llm_base_url", "llm_api_key", "llm_model", "temperature", "default_target_lang",
     "style_guide", "price_per_m_tokens", "team_name", "provider", "max_rpm",
 }
+MAX_PENDING_PROPOSALS = 300
+PROPOSAL_LIMITER = LoginLimiter(limit=30, window=3600.0)  # per teammate's address, per hour
+
+
+def new_batch(kind: str) -> str:
+    return f"{kind}-{uuid.uuid4().hex[:12]}"
 
 
 def db_dep() -> Database:
@@ -125,6 +134,11 @@ def create_app() -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/suggest", include_in_schema=False)
+    async def member_page():
+        """Teammates (team key only) can browse the glossary and propose terms here."""
+        return FileResponse(STATIC_DIR / "suggest.html")
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -269,6 +283,8 @@ def create_app() -> FastAPI:
                 "openai": f"{base}/v1/chat/completions",
                 "custom": f"{base}/imme?token={team_key}",
             },
+            "suggest_url": f"{base}/suggest#key={team_key}",
+            "pending_proposals": db.count_pending_proposals(),
             "configured": s.configured,
             "model": s.model,
             "default_target_lang": s.default_target_lang,
@@ -352,29 +368,55 @@ def create_app() -> FastAPI:
         if len(source) > 200 or len(target) > 200:
             raise AppError(400, "term_too_long", "Terms are limited to 200 characters.", max=200)
         lang = canon(payload.get("target_lang") or load_settings(db).default_target_lang)
+        note = str(payload.get("note", "")).strip()[:300]
+        conditional = truthy(payload.get("conditional", False))
+        if conditional and not note:
+            raise AppError(400, "condition_needs_note", "Say in the note when this translation applies.")
         return {
             "source": source,
             "target": target,
             "target_lang": lang,
-            "note": str(payload.get("note", "")).strip()[:300],
-            "case_sensitive": bool(payload.get("case_sensitive", False)),
+            "note": note,
+            "case_sensitive": truthy(payload.get("case_sensitive", False)),
+            "conditional": conditional,
         }
+
+    def truthy(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+        return bool(value)
+
+    def check_warnings(t: dict, payload: dict, db: Database) -> None:
+        """Very short, everyday or very broad terms are saved only after the admin confirms."""
+        if truthy(payload.get("force")):
+            return
+        report = term_warnings(db, t["source"], t["target_lang"], t["case_sensitive"])
+        if report["warnings"]:
+            raise AppError(409, "term_warning", f"Check “{t['source']}” before saving it.", term=t["source"], **report)
 
     @app.get("/api/glossary", dependencies=[Depends(admin_dep)])
     async def list_glossary(q: str = "", db: Database = Depends(db_dep)):
-        return {"terms": db.list_glossary(q.strip())}
+        terms = db.list_glossary(q.strip())
+        for row in terms:
+            row["warn"] = static_warnings(row["source"], bool(row["case_sensitive"]))
+        return {"terms": terms}
 
     @app.post("/api/glossary", dependencies=[Depends(admin_dep)])
     async def add_term(payload: dict = Body(...), db: Database = Depends(db_dep)):
         t = clean_term(payload, db)
+        existing = db.find_term(t["source"], t["target_lang"])
+        if not existing or bool(existing["case_sensitive"]) != t["case_sensitive"]:
+            check_warnings(t, payload, db)
         return db.upsert_term(**t)
 
     @app.post("/api/glossary/bulk", dependencies=[Depends(admin_dep)])
     async def add_terms(payload: dict = Body(...), db: Database = Depends(db_dep)):
+        """Used for AI suggestions and the example terms. One history group, so one undo."""
         added = 0
+        batch = new_batch("bulk")
         for item in payload.get("terms", [])[:1000]:
             try:
-                db.upsert_term(**clean_term(item, db))
+                db.upsert_term(**clean_term(item, db), batch=batch)
                 added += 1
             except AppError:
                 continue
@@ -383,12 +425,19 @@ def create_app() -> FastAPI:
     @app.put("/api/glossary/{term_id}", dependencies=[Depends(admin_dep)])
     async def edit_term(term_id: int, payload: dict = Body(...), db: Database = Depends(db_dep)):
         t = clean_term(payload, db)
+        current = db.get_term(term_id)
+        if not current:
+            raise AppError(404, "term_not_found", "Term not found.")
         clash = db.query_one(
             "SELECT id FROM glossary WHERE source = ? AND target_lang = ? AND id != ?",
             (t["source"], t["target_lang"], term_id),
         )
         if clash:
             raise AppError(409, "term_exists", "That term already exists for this language.")
+        if (current["source"], current["target_lang"], bool(current["case_sensitive"])) != (
+            t["source"], t["target_lang"], t["case_sensitive"]
+        ):
+            check_warnings(t, payload, db)  # only when what the term matches changes
         row = db.update_term(term_id, **t)
         if not row:
             raise AppError(404, "term_not_found", "Term not found.")
@@ -404,9 +453,9 @@ def create_app() -> FastAPI:
     async def export_glossary(db: Database = Depends(db_dep)):
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["source", "target", "target_lang", "note", "case_sensitive"])
+        w.writerow(["source", "target", "target_lang", "note", "case_sensitive", "conditional"])
         for r in db.list_glossary():
-            w.writerow([r["source"], r["target"], r["target_lang"], r["note"], r["case_sensitive"]])
+            w.writerow([r["source"], r["target"], r["target_lang"], r["note"], r["case_sensitive"], r["conditional"]])
         return Response(
             "﻿" + buf.getvalue(),
             media_type="text/csv; charset=utf-8",
@@ -423,17 +472,119 @@ def create_app() -> FastAPI:
             header = [c.strip().lower() for c in rows[0]]
             rows = rows[1:]
         else:
-            header = ["source", "target", "target_lang", "note", "case_sensitive"]
+            header = ["source", "target", "target_lang", "note", "case_sensitive", "conditional"]
         added, skipped = 0, 0
+        batch = new_batch("import")  # the whole file is one history group, so one undo
         for row in rows[:5000]:
             item = {header[i]: row[i] for i in range(min(len(header), len(row)))}
-            item["case_sensitive"] = str(item.get("case_sensitive", "")).strip().lower() in ("1", "true", "yes")
             try:
-                db.upsert_term(**clean_term(item, db))
+                db.upsert_term(**clean_term(item, db), batch=batch)
                 added += 1
             except AppError:
                 skipped += 1
         return {"added": added, "skipped": skipped}
+
+    # ------------------------------------------------------------------ glossary history
+    @app.get("/api/glossary/history", dependencies=[Depends(admin_dep)])
+    async def glossary_history(db: Database = Depends(db_dep)):
+        return {"groups": db.list_history()}
+
+    @app.post("/api/glossary/history/{entry_id}/undo", dependencies=[Depends(admin_dep)])
+    async def undo_change(entry_id: int, db: Database = Depends(db_dep)):
+        try:
+            count = db.undo(entry_id)
+        except LookupError:
+            raise AppError(404, "history_not_found", "That change is no longer in the history.")
+        except HistoryConflict as exc:
+            if exc.code == "already_undone":
+                raise AppError(409, "already_undone", "That change has already been undone.")
+            raise AppError(409, "history_conflict",
+                           f"“{exc.term}” has changed since. Undo the newer change first.", term=exc.term)
+        return {"undone": count}
+
+    # ------------------------------------------------------------------ proposals from teammates
+    def team_term(row: dict) -> dict:
+        return {k: row[k] for k in ("source", "target", "target_lang", "note", "case_sensitive", "conditional")}
+
+    @app.get("/api/team/glossary")
+    async def team_glossary(request: Request, db: Database = Depends(db_dep)):
+        require_team_key(request, db)
+        s = load_settings(db)
+        return {
+            "team_name": db.get_setting("team_name", "") or "",
+            "default_target_lang": s.default_target_lang,
+            "languages": LANG_NAMES,
+            "terms": [team_term(r) for r in db.list_glossary()[:5000]],
+        }
+
+    @app.post("/api/team/proposals")
+    async def propose_term(request: Request, db: Database = Depends(db_dep)):
+        require_team_key(request, db)
+        payload = await read_json(request)
+        cid = client_id(request)
+        if PROPOSAL_LIMITER.blocked(cid):
+            raise AppError(429, "too_many_proposals", "Too many suggestions from this device. Try again later.")
+        t = clean_term({**payload, "conditional": False, "case_sensitive": False}, db)
+        name = str(payload.get("name", "")).strip()
+        if len(name) > 40:
+            raise AppError(400, "name_too_long", "Keep your name under 40 characters.", max=40)
+        if db.count_pending_proposals() >= MAX_PENDING_PROPOSALS:
+            raise AppError(429, "proposals_full", "Too many suggestions are waiting for review.")
+        PROPOSAL_LIMITER.fail(cid)  # counts towards the hourly limit
+        pid = db.add_proposal(t["source"], t["target"], t["target_lang"], t["note"], name, cid)
+        return {"ok": True, "id": pid}
+
+    def existing_for(db: Database, source: str, target_lang: str) -> dict | None:
+        return db.query_one(
+            "SELECT * FROM glossary WHERE lower(source) = lower(?) AND target_lang = ? ORDER BY id LIMIT 1",
+            (source, target_lang),
+        )
+
+    @app.get("/api/proposals", dependencies=[Depends(admin_dep)])
+    async def list_proposals(db: Database = Depends(db_dep)):
+        out = []
+        for p in db.pending_proposals():
+            current = existing_for(db, p["source"], p["target_lang"])
+            out.append({
+                **p,
+                "current": team_term(current) if current else None,
+                "warn": static_warnings(p["source"], bool(current and current["case_sensitive"])),
+            })
+        return {"proposals": out}
+
+    def pending(db: Database, proposal_id: int) -> dict:
+        p = db.get_proposal(proposal_id)
+        if not p:
+            raise AppError(404, "proposal_not_found", "That suggestion no longer exists.")
+        if p["status"] != "pending":
+            raise AppError(409, "proposal_decided", "That suggestion has already been handled.")
+        return p
+
+    @app.post("/api/proposals/{proposal_id}/approve", dependencies=[Depends(admin_dep)])
+    async def approve_proposal(proposal_id: int, payload: dict = Body(default={}), db: Database = Depends(db_dep)):
+        p = pending(db, proposal_id)
+        current = existing_for(db, p["source"], p["target_lang"])
+        t = clean_term({
+            # An existing term keeps its spelling and settings; the proposal changes the translation.
+            "source": current["source"] if current else p["source"],
+            "target": payload.get("target") or p["target"],
+            "target_lang": p["target_lang"],
+            # The teammate's note explains their reason; the admin decides what note the AI should see.
+            "note": payload["note"] if "note" in payload else (current["note"] if current else p["note"]),
+            "case_sensitive": bool(current and current["case_sensitive"]),
+            "conditional": payload.get("conditional", bool(current and current["conditional"])),
+        }, db)
+        if not current:
+            check_warnings(t, payload, db)
+        row = db.upsert_term(**t, origin=f"proposal:{p['name']}")
+        db.decide_proposal(proposal_id, "approved", row["id"])
+        return {"term": row}
+
+    @app.post("/api/proposals/{proposal_id}/reject", dependencies=[Depends(admin_dep)])
+    async def reject_proposal(proposal_id: int, db: Database = Depends(db_dep)):
+        pending(db, proposal_id)
+        db.decide_proposal(proposal_id, "rejected")
+        return {"ok": True}
 
     @app.post("/api/glossary/suggest", dependencies=[Depends(admin_dep)])
     async def suggest(payload: dict = Body(...), db: Database = Depends(db_dep)):

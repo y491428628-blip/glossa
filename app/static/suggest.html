@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta name="referrer" content="no-referrer">
+  <title>Glossa</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='9' width='28' height='15' rx='3' fill='%23f5e15a'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='16' text-anchor='middle' fill='%231b2440'%3EGl%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css?v=0.3.0">
+</head>
+<body>
+
+<header class="bar">
+  <div class="bar-inner">
+    <span class="brand"><span class="brand-word">Gl<span>oss</span>a</span><span class="brand-team" id="team-name"></span></span>
+    <select class="lang-picker member-picker" data-i18n-aria="lang.label"></select>
+  </div>
+</header>
+
+<main>
+  <!-- ---------- no team key yet ---------- -->
+  <section id="key-gate" hidden>
+    <div class="panel stack gate">
+      <h1 data-i18n="member.key_title"></h1>
+      <p class="muted" data-i18n="member.key_body"></p>
+      <form id="key-form" class="stack">
+        <label class="field"><span class="field-label" data-i18n="member.key_label"></span>
+          <input type="password" name="key" required autocomplete="off"></label>
+        <p class="form-error" role="alert"></p>
+        <button class="btn btn-primary" type="submit" data-i18n="member.key_submit"></button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ---------- glossary + suggestion form ---------- -->
+  <section id="member-app" hidden>
+    <h1 data-i18n="member.title"></h1>
+    <p class="lede" data-i18n="member.lede"></p>
+
+    <div class="member-grid section" style="margin-top:28px">
+      <form class="panel stack" id="propose-form">
+        <h2 data-i18n="member.form_title"></h2>
+        <label class="field"><span class="field-label" data-i18n="glossary.term"></span>
+          <input type="text" name="source" required maxlength="200" class="lang-text" data-i18n-ph="glossary.term_ph"></label>
+        <label class="field"><span class="field-label" data-i18n="member.target"></span>
+          <input type="text" name="target" required maxlength="200" class="lang-text" data-i18n-ph="glossary.target_ph"></label>
+        <label class="field"><span class="field-label" data-i18n="glossary.into"></span>
+          <select name="target_lang" class="lang-select"></select></label>
+        <label class="field"><span class="field-label" data-i18n-html="member.note_html"></span>
+          <input type="text" name="note" maxlength="300" data-i18n-ph="member.note_ph"></label>
+        <label class="field"><span class="field-label" data-i18n-html="member.name_html"></span>
+          <input type="text" name="name" maxlength="40" autocomplete="nickname"></label>
+        <p class="form-error" role="alert"></p>
+        <div class="row">
+          <button class="btn btn-primary" type="submit" data-i18n="member.submit"></button>
+          <span class="status-ok small" id="propose-status" role="status"></span>
+        </div>
+      </form>
+
+      <div class="panel">
+        <div class="section-head" style="margin-bottom:12px">
+          <h2 id="member-count"></h2>
+          <input type="search" id="member-search" data-i18n-ph="glossary.search_ph" data-i18n-aria="glossary.search_ph" style="max-width:240px">
+        </div>
+        <div class="table-wrap" id="member-list"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="/static/i18n.js?v=0.3.0"></script>
+<script src="/static/member.js?v=0.3.0"></script>
+</body>
+</html>

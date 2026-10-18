@@ -133,6 +133,17 @@ def term_core(source: str) -> str:
     return _SEPARATORS.join(parts)
 
 
+def compile_term(source: str, case_sensitive: bool) -> tuple[re.Pattern, re.Pattern]:
+    """(pattern that finds the term inside a paragraph, pattern for a paragraph that is only the term)."""
+    src = source.strip()
+    core = term_core(src)
+    # Word boundaries only make sense at Latin/digit edges; CJK terms match as substrings.
+    left = r"(?<![A-Za-z0-9])" if _LATIN_EDGE.match(src[0]) else ""
+    right = r"(?![A-Za-z0-9])" if _LATIN_EDGE.match(src[-1]) else ""
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(left + core + right, flags), re.compile(core, flags)
+
+
 @dataclass
 class Term:
     id: int
@@ -142,6 +153,8 @@ class Term:
     case_sensitive: bool
     pattern: re.Pattern      # finds the term inside a paragraph
     whole: re.Pattern        # matches a paragraph that is only the term
+    note: str = ""           # sent to the AI with the term
+    conditional: bool = False  # the AI decides from the note whether the term applies; never forced
 
 
 class GlossaryMatcher:
@@ -160,11 +173,7 @@ class GlossaryMatcher:
             src = row["source"].strip()
             if not src:
                 continue
-            core = term_core(src)
-            # Word boundaries only make sense at Latin/digit edges; CJK terms match as substrings.
-            left = r"(?<![A-Za-z0-9])" if _LATIN_EDGE.match(src[0]) else ""
-            right = r"(?![A-Za-z0-9])" if _LATIN_EDGE.match(src[-1]) else ""
-            flags = 0 if row["case_sensitive"] else re.IGNORECASE
+            pattern, whole = compile_term(src, bool(row["case_sensitive"]))
             terms.append(
                 Term(
                     id=row["id"],
@@ -172,8 +181,10 @@ class GlossaryMatcher:
                     target=row["target"],
                     target_lang=row["target_lang"],
                     case_sensitive=bool(row["case_sensitive"]),
-                    pattern=re.compile(left + core + right, flags),
-                    whole=re.compile(core, flags),
+                    pattern=pattern,
+                    whole=whole,
+                    note=(row.get("note") or "").strip(),
+                    conditional=bool(row.get("conditional")),
                 )
             )
         terms.sort(key=lambda t: -len(t.source))  # longer terms first: "census date" before "date"
@@ -194,6 +205,8 @@ class GlossaryMatcher:
         if not stripped or len(stripped) > 200:
             return None
         for t in self._for_lang(canon(target_lang)):
+            if t.conditional:
+                continue  # whether it applies depends on the meaning, so the AI decides
             if t.whole.fullmatch(stripped):
                 return t
         return None
@@ -202,20 +215,39 @@ class GlossaryMatcher:
 MATCHER = GlossaryMatcher()
 
 
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
 def glossary_block(terms: list[Term], strict: bool = False) -> str:
-    if not terms:
-        return ""
-    lines = "\n".join(f'- "{t.source}" → "{t.target}"' for t in terms)
-    intro = (
-        "Team glossary. These translations are mandatory. Whenever a source term appears "
-        "(including plural or possessive forms), translate it exactly as shown:\n"
-    )
-    if strict:
-        intro = (
-            "Team glossary. A previous translation ignored these terms. Use each translation below "
-            "exactly, character for character, wherever its source term appears:\n"
+    """Mandatory terms first (with their notes as context), then terms whose use depends on the meaning."""
+    fixed = [t for t in terms if not t.conditional]
+    depends = [t for t in terms if t.conditional]
+    parts = []
+    if fixed:
+        lines = "\n".join(
+            f'- "{t.source}" → "{t.target}"' + (f" (note: {_one_line(t.note)})" if t.note else "") for t in fixed
         )
-    return intro + lines
+        intro = (
+            "Team glossary. These translations are mandatory. Whenever a source term appears "
+            "(including plural or possessive forms), translate it exactly as shown:\n"
+        )
+        if strict:
+            intro = (
+                "Team glossary. A previous translation ignored these terms. Use each translation below "
+                "exactly, character for character, wherever its source term appears:\n"
+            )
+        parts.append(intro + lines)
+    if depends:
+        lines = "\n".join(
+            f'- "{t.source}" → "{t.target}" (applies when: {_one_line(t.note) or "the context clearly fits"})'
+            for t in depends
+        )
+        parts.append(
+            "Context-dependent glossary terms. Use the given translation only where the condition applies; "
+            "elsewhere translate the word normally:\n" + lines
+        )
+    return "\n\n".join(parts)
 
 
 def term_applied(term: Term, translation: str) -> bool:
@@ -225,7 +257,62 @@ def term_applied(term: Term, translation: str) -> bool:
 
 
 def signature(terms: list[Term]) -> str:
-    return "|".join(sorted(f"{t.source}␟{t.target}" for t in terms))
+    """Part of the memory key. A term's note and mode only appear when set, so paragraphs cached
+    before notes were sent to the AI keep their keys."""
+    def one(t: Term) -> str:
+        s = f"{t.source}␟{t.target}"
+        if t.note:
+            s += f"␟{t.note}"
+        if t.conditional:
+            s += "␟ctx"
+        return s
+    return "|".join(sorted(one(t) for t in terms))
+
+
+# ----------------------------------------------------------------------------------
+# Checks before a term is saved
+# ----------------------------------------------------------------------------------
+# Everyday words that are rarely worth forcing one translation on. Not exhaustive: the memory
+# check below catches site-specific words too.
+COMMON_WORDS = frozenset("""
+a about after again all also an and any are as at back be because been before being below between both but by
+can could day days did do does done down during each even every few first for from get go good had has have he
+her here him his how i if in into is it its just key last like make many may me more most much must my new
+next no not now of off on once one only or other our out over own page part people please read same see she
+should so some such take than that the their them then there these they this those through time to too under
+until up us use used very was way we week weeks well were what when where which while who why will with would
+year years yes yet you your home news date dates term terms information info about more contact click here
+search menu link links back top view show open close start end note notes item items name number type list
+""".split())
+
+
+def static_warnings(source: str, case_sensitive: bool) -> list[str]:
+    """Warnings that need no data: very short terms and everyday words."""
+    src = source.strip()
+    warnings = []
+    latin = bool(_LATIN_EDGE.match(src[:1] or " "))
+    if (latin and len(src) <= 3 and not case_sensitive) or (not latin and len(src) <= 1):
+        warnings.append("short")
+    if latin and " " not in src and src.lower() in COMMON_WORDS:
+        warnings.append("common")
+    return warnings
+
+
+def term_warnings(db: Database, source: str, target_lang: str, case_sensitive: bool) -> dict:
+    """What saving this term would affect: static warnings, plus how much of the shared memory it
+    matches. A term that matches a large share of everything already translated is probably too broad."""
+    warnings = static_warnings(source, case_sensitive)
+    pattern, _ = compile_term(source, case_sensitive)
+    rows = db.query(
+        "SELECT source_text FROM cache WHERE kind = 'para' AND target_lang = ? ORDER BY created_at DESC LIMIT 3000",
+        (canon(target_lang),),
+    )
+    hits = [r["source_text"] for r in rows if pattern.search(r["source_text"])]
+    total = len(rows)
+    if total >= 10 and len(hits) / total >= 0.2 and len(hits) >= 5:
+        warnings.append("broad")
+    samples = [h if len(h) <= 140 else h[:137] + "…" for h in hits[:2]]
+    return {"warnings": warnings, "affected": len(hits), "total": total, "samples": samples}
 
 
 def sha(*parts: str) -> str:
@@ -554,12 +641,16 @@ class Dispatcher:
                 right = await self.translate(db, s, jobs[mid:], strict, check_terms)
                 return left + right
         if check_terms:
-            missed = [i for i, j in enumerate(jobs) if any(not term_applied(t, outs[i]) for t in j.terms)]
+            # Only mandatory terms are enforced; conditional ones are the AI's call by design.
+            def must(job: Job) -> list[Term]:
+                return [t for t in job.terms if not t.conditional]
+
+            missed = [i for i, j in enumerate(jobs) if any(not term_applied(t, outs[i]) for t in must(j))]
             if missed:
                 try:
                     fixed = await self.translate(db, s, [jobs[i] for i in missed], strict=True, check_terms=False)
                     for i, out in zip(missed, fixed):
-                        if all(term_applied(t, out) for t in jobs[i].terms):
+                        if all(term_applied(t, out) for t in must(jobs[i])):
                             outs[i] = out
                 except LLMError:
                     pass  # keep the first translation; compliance is reported in stats
@@ -678,7 +769,8 @@ async def translate_texts(db: Database, texts: list[str], target_lang: str | Non
     for i, res in enumerate(results):
         if res.error is None:
             res.terms = [
-                {"source": t.source, "target": t.target, "applied": term_applied(t, res.text)}
+                {"source": t.source, "target": t.target, "applied": term_applied(t, res.text),
+                 "conditional": t.conditional}
                 for t in item_terms[i]
             ]
     db.add_term_hits(t.id for i, terms in enumerate(item_terms) if results[i].error is None for t in terms)
@@ -698,8 +790,10 @@ def _log(db: Database, endpoint: str, outcome: BatchOutcome, item_terms: list[li
         llm_calls=outcome.llm_calls,
         chars_in=sum(len(r.source) for r in items),
         chars_cached=sum(len(r.source) for r in items if r.cached or r.direct),
-        terms_matched=sum(len(item_terms[i]) for i, r in enumerate(outcome.items) if not r.skipped and not r.error),
-        terms_applied=sum(1 for r in items for t in r.terms if t["applied"]),
+        # Compliance only counts mandatory terms: a conditional term left out may be correct.
+        terms_matched=sum(sum(1 for t in item_terms[i] if not t.conditional)
+                          for i, r in enumerate(outcome.items) if not r.skipped and not r.error),
+        terms_applied=sum(1 for r in items for t in r.terms if t["applied"] and not t["conditional"]),
         ms=int((time.perf_counter() - started) * 1000),
         ok=err is None,
         error=err.raw if err else "",
@@ -820,8 +914,8 @@ async def _proxy_whole(db: Database, settings: EngineSettings, messages: list[di
             llm_calls=0 if cached or err else 1,
             chars_in=len(user_text),
             chars_cached=len(user_text) if cached else 0,
-            terms_matched=len(terms) if not err else 0,
-            terms_applied=sum(1 for t in terms if term_applied(t, content)) if not err else 0,
+            terms_matched=sum(1 for t in terms if not t.conditional) if not err else 0,
+            terms_applied=sum(1 for t in terms if not t.conditional and term_applied(t, content)) if not err else 0,
             ms=int((time.perf_counter() - started) * 1000),
             ok=err is None,
             error=err.raw if err else "",

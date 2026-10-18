@@ -22,7 +22,9 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-GLOSSARY_LINE = re.compile(r'^- "(.+?)" → "(.+?)"$', re.M)
+# Mandatory terms, optionally followed by "(note: …)". Context-dependent terms end in "(applies when: …)"
+# and are ignored, like a model deciding the condition does not apply.
+GLOSSARY_LINE = re.compile(r'^- "(.+?)" → "(.+?)"(?: \(note: .*\))?$', re.M)
 MARK = re.compile(r"\[\[p(\d+)\]\]")
 
 

@@ -68,7 +68,7 @@ def test_setup_login_flow(client):
     assert r.status_code == 401 and r.json()["code"] == "not_signed_in"
     setup_admin(client)
     assert client.get("/api/me").json() == {
-        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.2.0",
+        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.3.0",
     }
     client.post("/api/logout")
     r = client.post("/api/login", json={"password": "nope"})
@@ -161,7 +161,7 @@ def test_plurals_hyphens_and_spaces_match(client):
 
 def test_word_boundaries(client):
     key = setup_admin(client)
-    client.post("/api/glossary", json={"source": "term", "target": "学期"})
+    client.post("/api/glossary", json={"source": "term", "target": "学期", "force": True})
     out = imme(client, key, ["Determine the terminal state"]).json()
     assert "学期" not in out["translations"][0]["text"]
 
@@ -359,6 +359,166 @@ def test_parse_paragraph_prompt():
     assert engine.parse_paragraph_prompt("Translate this: hello") is None
 
 
+# ------------------------------------------------------------------ glossary safety (v0.3)
+def test_common_or_broad_terms_need_confirmation(client):
+    key = setup_admin(client)
+    r = client.post("/api/glossary", json={"source": "date", "target": "日期"})
+    assert r.status_code == 409 and r.json()["code"] == "term_warning"
+    assert "common" in r.json()["params"]["warnings"]
+    assert client.get("/api/glossary").json()["terms"] == []  # nothing saved without confirmation
+
+    # A word that is not "common" but appears in most of what the team has read is flagged too.
+    imme(client, key, [f"Enrolment step {i} for students" for i in range(12)])
+    r = client.post("/api/glossary", json={"source": "enrolment", "target": "注册"})
+    params = r.json()["params"]
+    assert r.status_code == 409 and params["warnings"] == ["broad"]
+    assert params["affected"] == 12 and params["total"] == 12 and params["samples"]
+
+    assert client.post("/api/glossary", json={"source": "enrolment", "target": "注册", "force": True}).status_code == 200
+    assert client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"}).status_code == 200
+    # Very short terms: flagged unless capitalisation must match (an acronym).
+    assert client.post("/api/glossary", json={"source": "WAM", "target": "加权平均分"}).json()["params"]["warnings"] == ["short"]
+    assert client.post("/api/glossary", json={"source": "WAM", "target": "加权平均分", "case_sensitive": True}).status_code == 200
+    warn = {t["source"]: t["warn"] for t in client.get("/api/glossary").json()["terms"]}
+    assert warn == {"census date": [], "enrolment": [], "WAM": []}
+
+
+def test_notes_reach_the_ai_and_conditional_terms_are_not_forced(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日", "note": "UNSW drop deadline"})
+    client.post("/api/glossary", json={"source": "term", "target": "学期", "force": True, "conditional": True,
+                                       "note": "only when it means a university teaching period"})
+    out = imme(client, key, ["The census date for this term is Sunday."]).json()["translations"]
+    system = mock_llm.app.state.last_messages[0]["content"]
+    assert '"census date" → "退课截止日" (note: UNSW drop deadline)' in system
+    assert '"term" → "学期" (applies when: only when it means a university teaching period)' in system
+    # The mock leaves the conditional term out, as a model would when it does not apply.
+    # That must not trigger the forced retry, and must not count against compliance.
+    assert "退课截止日" in out[0]["text"] and "学期" not in out[0]["text"]
+    assert mock_llm.app.state.calls == 1
+    assert client.get("/api/stats").json()["glossary_compliance"] == 1.0
+    # A paragraph that is only a conditional term goes to the AI instead of the glossary shortcut.
+    imme(client, key, ["Term"])
+    assert mock_llm.app.state.calls == 2
+
+    r = client.post("/api/glossary", json={"source": "subject", "target": "科目", "conditional": True})
+    assert r.status_code == 400 and r.json()["code"] == "condition_needs_note"
+
+
+def test_editing_a_note_retranslates_but_old_memory_survives_the_upgrade(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    imme(client, key, ["The census date is Sunday."])
+    term = client.get("/api/glossary").json()["terms"][0]
+    # Terms without notes keep the v0.2 memory key, so upgrading does not throw away cached pages.
+    t = engine.Term(1, "census date", "退课截止日", "zh-CN", False, None, None)
+    assert engine.signature([t]) == "census date␟退课截止日"
+    client.put(f"/api/glossary/{term['id']}", json={**term, "note": "UNSW drop deadline"})
+    imme(client, key, ["The census date is Sunday."])
+    assert mock_llm.app.state.calls == 2  # the AI now sees the note, so the paragraph is redone once
+    imme(client, key, ["The census date is Sunday."])
+    assert mock_llm.app.state.calls == 2
+
+
+def test_history_and_undo(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    term = client.get("/api/glossary").json()["terms"][0]
+    client.put(f"/api/glossary/{term['id']}", json={**term, "target": "人口普查日"})  # a bad edit
+    groups = client.get("/api/glossary/history").json()["groups"]
+    assert [g["kind"] for g in groups] == ["edit", "add"]
+    assert groups[0]["entries"][0]["prev"]["target"] == "退课截止日"
+
+    assert client.post(f"/api/glossary/history/{groups[0]['id']}/undo").json() == {"undone": 1}
+    assert client.get("/api/glossary").json()["terms"][0]["target"] == "退课截止日"
+    # Translations follow the restored term straight away.
+    assert "退课截止日" in imme(client, key, ["The census date is Sunday."]).json()["translations"][0]["text"]
+    r = client.post(f"/api/glossary/history/{groups[0]['id']}/undo")
+    assert r.status_code == 409 and r.json()["code"] == "already_undone"
+
+    # Deleting and undoing brings the term back.
+    client.delete(f"/api/glossary/{term['id']}")
+    delete_id = client.get("/api/glossary/history").json()["groups"][0]["id"]
+    client.post(f"/api/glossary/history/{delete_id}/undo")
+    assert [t["target"] for t in client.get("/api/glossary").json()["terms"]] == ["退课截止日"]
+
+    # Undoing an old change after the term was edited again would overwrite newer work: refused.
+    term = client.get("/api/glossary").json()["terms"][0]
+    client.put(f"/api/glossary/{term['id']}", json={**term, "target": "截止日A"})
+    old_edit = client.get("/api/glossary/history").json()["groups"][0]["id"]
+    client.put(f"/api/glossary/{term['id']}", json={**term, "target": "截止日B"})
+    r = client.post(f"/api/glossary/history/{old_edit}/undo")
+    assert r.status_code == 409 and r.json()["code"] == "history_conflict"
+    assert client.get("/api/glossary").json()["terms"][0]["target"] == "截止日B"
+
+
+def test_undo_a_whole_import(client):
+    setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    csv_text = "source,target\ncensus date,人口普查日\nWAM,加权平均分\nZID,学号\n"
+    assert client.post("/api/glossary/import", json={"csv": csv_text}).json()["added"] == 3
+    group = client.get("/api/glossary/history").json()["groups"][0]
+    assert group["kind"] == "import" and group["count"] == 3
+    assert client.post(f"/api/glossary/history/{group['id']}/undo").json() == {"undone": 3}
+    terms = client.get("/api/glossary").json()["terms"]
+    assert [(t["source"], t["target"]) for t in terms] == [("census date", "退课截止日")]
+    # The undo is itself in the history and can be undone (redo).
+    redo = client.get("/api/glossary/history").json()["groups"][0]
+    assert redo["kind"] == "undo" and redo["count"] == 3
+    client.post(f"/api/glossary/history/{redo['id']}/undo")
+    assert len(client.get("/api/glossary").json()["terms"]) == 3
+
+
+def test_teammates_propose_and_admin_reviews(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "人口普查日"})  # wrong
+    h = {"Authorization": f"Bearer {key}"}
+    glossary = client.get("/api/team/glossary", headers=h).json()
+    assert glossary["terms"][0]["target"] == "人口普查日" and glossary["team_name"] == "UNSW CSSA"
+
+    # No key, no access: neither the glossary nor proposals.
+    client.post("/api/logout")
+    assert client.get("/api/team/glossary").status_code == 401
+    r = client.post("/api/team/proposals", json={"source": "x y", "target": "z"})
+    assert r.status_code == 401 and r.json()["code"] == "wrong_team_key"
+    assert client.post("/api/proposals/1/approve").status_code == 401  # teammates cannot approve
+
+    p1 = client.post("/api/team/proposals", headers=h, json={
+        "source": "Census Date", "target": "退课截止日", "note": "It's the drop deadline", "name": "Amy"}).json()["id"]
+    again = client.post("/api/team/proposals", headers=h, json={"source": "census date", "target": "退课截止日"}).json()["id"]
+    assert again == p1  # the same suggestion twice is kept once
+    p2 = client.post("/api/team/proposals", headers=h, json={"source": "tutorial", "target": "辅导课"}).json()["id"]
+
+    client.post("/api/login", json={"password": "correct-horse"})
+    pending = client.get("/api/proposals").json()["proposals"]
+    assert [p["id"] for p in pending] == [p1, p2]
+    assert pending[0]["current"]["target"] == "人口普查日"  # shown next to the existing translation
+    assert client.get("/api/overview").json()["pending_proposals"] == 2
+
+    client.post(f"/api/proposals/{p1}/approve", json={})
+    client.post(f"/api/proposals/{p2}/reject")
+    terms = client.get("/api/glossary").json()["terms"]
+    assert [(t["source"], t["target"]) for t in terms] == [("census date", "退课截止日")]  # existing spelling kept
+    assert client.get("/api/proposals").json()["proposals"] == []
+    assert client.post(f"/api/proposals/{p2}/approve").json()["code"] == "proposal_decided"
+    latest = client.get("/api/glossary/history").json()["groups"][0]["entries"][0]
+    assert latest["origin"] == "proposal:Amy" and latest["prev"]["target"] == "人口普查日"
+
+
+def test_proposals_are_rate_limited(client, monkeypatch):
+    from app import main as mainmod
+
+    key = setup_admin(client)
+    monkeypatch.setattr(mainmod.PROPOSAL_LIMITER, "limit", 2)
+    mainmod.PROPOSAL_LIMITER.reset("testclient")
+    h = {"Authorization": f"Bearer {key}"}
+    for word in ("alpha one", "beta two"):
+        assert client.post("/api/team/proposals", headers=h, json={"source": word, "target": "x"}).status_code == 200
+    r = client.post("/api/team/proposals", headers=h, json={"source": "gamma three", "target": "x"})
+    assert r.status_code == 429 and r.json()["code"] == "too_many_proposals"
+    mainmod.PROPOSAL_LIMITER.reset("testclient")
+
+
 # ------------------------------------------------------------------ misc
 def test_csv_roundtrip_and_suggest(client):
     setup_admin(client)
@@ -386,6 +546,25 @@ def test_upgrade_from_v1_database(tmp_path):
     database.log_event(endpoint="openai", items=3, glossary_direct=1, error_code="")
     rows = database.query("SELECT items, glossary_direct FROM events ORDER BY id")
     assert rows == [{"items": 1, "glossary_direct": 0}, {"items": 3, "glossary_direct": 1}]
+
+
+def test_upgrade_from_v2_glossary(tmp_path):
+    path = tmp_path / "v2.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE glossary (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, target TEXT NOT NULL, "
+        "target_lang TEXT NOT NULL DEFAULT 'zh-CN', note TEXT NOT NULL DEFAULT '', "
+        "case_sensitive INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, "
+        "created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE (source, target_lang));"
+        "INSERT INTO glossary (source, target, created_at, updated_at) VALUES ('census date', '退课截止日', 1, 1);"
+    )
+    con.commit()
+    con.close()
+    database = dbmod.Database(path)
+    row = database.find_term("census date", "zh-CN")
+    assert row["conditional"] == 0 and row["target"] == "退课截止日"
+    database.update_term(row["id"], target="截止日")
+    assert database.list_history()[0]["entries"][0]["prev"]["target"] == "退课截止日"
 
 
 def test_healthz_and_index(client):

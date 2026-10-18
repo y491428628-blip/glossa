@@ -13,6 +13,9 @@ ALL_CODES = (
     "not_configured", "upstream_rate_limit", "upstream_unavailable", "upstream_auth",
     "upstream_not_found", "upstream_unreachable", "upstream_bad_response", "upstream_error",
     "suggest_failed", "internal_error",
+    # glossary safety (v0.3)
+    "term_warning", "condition_needs_note", "history_not_found", "history_conflict", "already_undone",
+    "proposal_not_found", "proposal_decided", "too_many_proposals", "proposals_full", "name_too_long",
 )
 
 

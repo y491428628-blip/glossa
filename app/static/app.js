@@ -1,9 +1,10 @@
 "use strict";
+/* Admin dashboard. Shared helpers (t, tn, fmt, esc, $, toast, …) come from i18n.js. */
 
-const $ = (sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
-
-const state = { settings: null, languages: {}, presets: {}, overview: null, glossary: [], suggestions: [], view: null };
+const state = {
+  settings: null, presets: {}, overview: null, glossary: [], aiSuggestions: [],
+  proposals: [], history: [], historyAll: false, view: null,
+};
 
 const SAMPLE_TEXT = [
   "The census date for Term 3 is Sunday of Week 4. If you drop a course after the census date, you will still be charged fees.",
@@ -12,106 +13,12 @@ const SAMPLE_TEXT = [
   "Members can collect their society hoodie at the welcome night in the Roundhouse.",
 ].join("\n");
 
-/* ---------------- i18n ---------------- */
-const UI_LANGS = ["en", "zh-CN", "zh-TW", "ja", "ko", "vi"];
-const LANG_STORE = "glossa.lang";
-let I18N = { _meta: { names: { en: "English" } }, en: {} };
-let LANG = "en";
-
-function storedLang() {
-  try { return localStorage.getItem(LANG_STORE); } catch { return null; }
-}
-function storeLang(lang) {
-  try { localStorage.setItem(LANG_STORE, lang); } catch { /* private mode: keep for this visit only */ }
-}
-
-/** Translate a key; {name} placeholders are filled from params. */
-function t(key, params = {}) {
-  const table = I18N[LANG] || {};
-  const s = table[key] ?? I18N.en[key] ?? key;
-  return s.replace(/\{(\w+)\}/g, (_, k) => (params[k] !== undefined ? params[k] : `{${k}}`));
-}
-/** Like t(), but picks the "_one" variant when count is 1 and the language has one. */
-function tn(key, count, params = {}) {
-  const table = I18N[LANG] || {};
-  const k = count === 1 && table[key + "_one"] ? key + "_one" : key;
-  return t(k, { n: fmt(count), ...params });
-}
-
-const fmt = (n) => new Intl.NumberFormat(LANG).format(n || 0);
-const pct = (x) => new Intl.NumberFormat(LANG, { maximumFractionDigits: 0 }).format(Math.round(x * 100));
-const usd = (x) => new Intl.NumberFormat(LANG, { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(x);
-function seconds(ms) {
-  try {
-    return new Intl.NumberFormat(LANG, { style: "unit", unit: "second", unitDisplay: "short", maximumFractionDigits: 1, minimumFractionDigits: 1 }).format(ms / 1000);
-  } catch { return `${(ms / 1000).toFixed(1)} s`; }
-}
-function shortDate(day) {
-  return new Date(day + "T00:00:00").toLocaleDateString(LANG, { month: "short", day: "numeric" });
-}
-function timeAgo(ts) {
-  const s = Math.round(ts - Date.now() / 1000);
-  const rtf = new Intl.RelativeTimeFormat(LANG, { numeric: "auto" });
-  if (Math.abs(s) < 60) return rtf.format(s, "second");
-  if (Math.abs(s) < 3600) return rtf.format(Math.round(s / 60), "minute");
-  if (Math.abs(s) < 86400) return rtf.format(Math.round(s / 3600), "hour");
-  return new Date(ts * 1000).toLocaleDateString(LANG);
-}
-/** Target-language names in the interface language, e.g. zh-CN shown as 简体中文 / Simplified Chinese / 中国語（簡体字）. */
-function langName(code) {
-  const tag = { "zh-CN": "zh-Hans", "zh-TW": "zh-Hant" }[code] || code;
-  try {
-    const name = new Intl.DisplayNames([LANG], { type: "language" }).of(tag);
-    if (name && name !== tag) return name;
-  } catch { /* older browser */ }
-  return state.languages[code] || code;
-}
-
-function applyStatic() {
-  document.documentElement.lang = LANG;
-  $$("[data-i18n]").forEach((el) => (el.textContent = t(el.dataset.i18n)));
-  $$("[data-i18n-html]").forEach((el) => (el.innerHTML = t(el.dataset.i18nHtml)));
-  $$("[data-i18n-ph]").forEach((el) => (el.placeholder = t(el.dataset.i18nPh)));
-  $$("[data-i18n-aria]").forEach((el) => el.setAttribute("aria-label", t(el.dataset.i18nAria)));
-  $$(".lang-picker").forEach((sel) => {
-    sel.innerHTML = UI_LANGS.map((l) => `<option value="${l}" lang="${l}"${l === LANG ? " selected" : ""}>${esc(I18N._meta.names[l] || l)}</option>`).join("");
-  });
-}
-
-async function loadI18n() {
-  try {
-    const res = await fetch("/static/i18n.json?v=0.2.0");
-    I18N = await res.json();
-  } catch { /* keep the built-in English fallback */ }
-  const saved = storedLang();
-  LANG = UI_LANGS.includes(saved) ? saved : (I18N._meta?.default || "en");
-  applyStatic();
-}
-
-function setLang(lang) {
-  if (!UI_LANGS.includes(lang) || lang === LANG) return;
-  LANG = lang;
-  storeLang(lang);
-  applyStatic();
+function onLangChange() {
   fillLangSelects();
   if (!$("#app").hidden) route(true);
 }
-document.addEventListener("change", (e) => {
-  if (e.target.matches(".lang-picker")) setLang(e.target.value);
-});
 
 /* ---------------- helpers ---------------- */
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-/** A localized message for an API error; the provider's raw text is kept separately as `raw`. */
-function errorText(err) {
-  if (err.code && (I18N[LANG]?.[`err.${err.code}`] || I18N.en[`err.${err.code}`])) return t(`err.${err.code}`, err.params || {});
-  if (err.status) return t("err.generic", { status: err.status });
-  return t("err.network");
-}
-
 async function api(path, opts = {}) {
   const init = { method: opts.method || "GET", headers: {}, credentials: "same-origin" };
   if (opts.body !== undefined) {
@@ -141,16 +48,6 @@ async function api(path, opts = {}) {
   return data;
 }
 
-let toastTimer;
-function toast(msg, isError = false) {
-  const el = $("#toast");
-  el.textContent = msg;
-  el.classList.toggle("error", isError);
-  el.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.hidden = true), isError ? 6000 : 2400);
-}
-
 async function busy(btn, label, fn) {
   const original = btn.textContent;
   btn.disabled = true;
@@ -158,21 +55,10 @@ async function busy(btn, label, fn) {
   try { return await fn(); } finally { btn.disabled = false; btn.textContent = original; }
 }
 
-async function copyText(text, msg) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    document.execCommand("copy"); ta.remove();
-  }
-  toast(msg || t("toast.copied"));
-}
-
 /** Wrap glossary terms in <mark>, escaping everything else. Source side also matches plural endings. */
 function highlight(text, terms, side) {
   const list = (terms || [])
-    .map((term) => ({ word: side === "source" ? term.source : term.target, applied: term.applied !== false }))
+    .map((term) => ({ word: side === "source" ? term.source : term.target, applied: term.applied !== false, conditional: Boolean(term.conditional) }))
     .filter((x) => x.word)
     .sort((a, b) => b.word.length - a.word.length);
   if (!list.length) return esc(text);
@@ -187,26 +73,59 @@ function highlight(text, terms, side) {
     const norm = (s) => s.toLowerCase().replace(/[\s\-]+/g, " ");
     const hit = list.find((x) => norm(m[0]).startsWith(norm(x.word)));
     out += esc(text.slice(last, m.index));
-    const missed = side === "source" && hit && !hit.applied;
-    out += `<mark class="term${missed ? " missed" : ""}"${missed ? ` title="${esc(t("highlight.missed"))}"` : ""}>${esc(m[0])}</mark>`;
+    const missed = side === "source" && hit && !hit.applied && !hit.conditional;
+    const cls = "term" + (missed ? " missed" : "") + (hit && hit.conditional ? " cond" : "");
+    const title = missed ? t("highlight.missed") : (hit && hit.conditional ? t("highlight.cond") : "");
+    out += `<mark class="${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(m[0])}</mark>`;
     last = m.index + m[0].length;
   }
   return out + esc(text.slice(last));
 }
 
 function langOptions(selected) {
-  return Object.keys(state.languages)
+  return Object.keys(LANG_FALLBACK)
     .map((code) => `<option value="${esc(code)}"${code === selected ? " selected" : ""}>${esc(langName(code))}</option>`)
     .join("");
 }
 function fillLangSelects() {
-  if (!Object.keys(state.languages).length) return;
+  if (!Object.keys(LANG_FALLBACK).length) return;
   const def = state.settings?.default_target_lang || "zh-CN";
   $$(".lang-select").forEach((sel) => { const keep = sel.value; sel.innerHTML = langOptions(keep || def); });
 }
 
 function rawDetails(raw) {
   return raw ? `<details class="err-details"><summary>${esc(t("err.details"))}</summary><pre>${esc(raw)}</pre></details>` : "";
+}
+
+/* ---------------- term warnings ---------------- */
+/** Explains why a term looks risky and asks whether to save it anyway. Resolves true to save. */
+function warningDialog(p) {
+  return new Promise((resolve) => {
+    const dlg = $("#warn-dialog");
+    const reasons = p.warnings.map((w) => `<li>${esc(t("warn." + w, { affected: fmt(p.affected), total: fmt(p.total) }))}</li>`).join("");
+    const affected = p.affected && !p.warnings.includes("broad") ? `<p class="small muted">${esc(tn("warn.affected", p.affected))}</p>` : "";
+    const samples = p.samples?.length
+      ? `<p class="small muted">${esc(t("warn.examples"))}</p><ul class="warn-samples">${p.samples.map((s) => `<li class="lang-text">${highlight(s, [{ source: p.term }], "source")}</li>`).join("")}</ul>`
+      : "";
+    $("#warn-body").innerHTML = `<h2 id="warn-title">${esc(t("warn.title", { term: p.term }))}</h2><ul class="warn-list">${reasons}</ul>${affected}${samples}<p class="small muted warn-tip">${esc(t("warn.tip"))}</p>`;
+    const done = (ok) => { dlg.close(); resolve(ok); };
+    $("#warn-save").onclick = () => done(true);
+    $("#warn-back").onclick = () => done(false);
+    dlg.oncancel = (e) => { e.preventDefault(); done(false); };
+    dlg.showModal();
+    $("#warn-back").focus();
+  });
+}
+
+/** Sends a glossary change. If the server flags the term, asks first and resends with force. Returns null if cancelled. */
+async function saveWithCheck(path, method, body) {
+  try {
+    return await api(path, { method, body });
+  } catch (err) {
+    if (err.code !== "term_warning") throw err;
+    if (!(await warningDialog(err.params))) return null;
+    return api(path, { method, body: { ...body, force: true } });
+  }
 }
 
 /* ---------------- auth ---------------- */
@@ -227,6 +146,7 @@ async function boot() {
   $("#team-name").textContent = me.team_name || "";
   await loadSettings();
   route();
+  refreshProposals().catch(() => {});
 }
 
 $("#setup-form").addEventListener("submit", async (e) => {
@@ -256,7 +176,7 @@ $("#signout").addEventListener("click", async () => {
 });
 
 /* ---------------- router ---------------- */
-const VIEWS = { overview: loadOverview, glossary: loadGlossary, try: renderTry, settings: renderSettings };
+const VIEWS = { overview: loadOverview, glossary: loadGlossaryView, try: renderTry, settings: renderSettings };
 function route(keepScroll = false) {
   if ($("#app").hidden) return;
   const view = (location.hash || "#overview").slice(1);
@@ -272,15 +192,26 @@ function route(keepScroll = false) {
 }
 window.addEventListener("hashchange", () => route());
 
+function setPendingBadge(n) {
+  const badge = $("#nav-badge");
+  badge.hidden = !n;
+  badge.textContent = fmt(n);
+  badge.setAttribute("aria-label", tn("nav.pending", n));
+}
+
 /* ---------------- overview ---------------- */
 async function loadOverview() {
   const o = await api("/api/overview");
   state.overview = o;
   const s = o.stats;
   $("#setup-notice").hidden = o.configured;
+  $("#proposal-notice").hidden = !o.pending_proposals;
+  $("#proposal-notice-text").textContent = tn("overview.proposals", o.pending_proposals);
+  setPendingBadge(o.pending_proposals);
   $("#ep-openai").textContent = o.endpoints.openai;
   $("#ep-custom").textContent = o.endpoints.custom;
   $("#team-key").textContent = o.team_key;
+  $("#suggest-url").textContent = o.suggest_url;
 
   const reused = s.cache_hits + s.glossary_direct;
   if (!s.items) {
@@ -372,15 +303,33 @@ document.addEventListener("click", (e) => {
 $("#copy-invite").addEventListener("click", () => {
   const o = state.overview;
   if (!o) return;
-  copyText(t("invite.text", { url: o.endpoints.openai, key: o.team_key }), t("toast.invite_copied"));
+  const text = t("invite.text", { url: o.endpoints.openai, key: o.team_key }) + "\n\n" + t("invite.member", { link: o.suggest_url });
+  copyText(text, t("toast.invite_copied"));
 });
 
 /* ---------------- glossary ---------------- */
+async function loadGlossaryView() {
+  await Promise.all([loadGlossary(), refreshProposals(), loadHistory()]);
+}
+
 async function loadGlossary() {
   const q = $("#glossary-search").value.trim();
   const { terms } = await api("/api/glossary" + (q ? `?q=${encodeURIComponent(q)}` : ""));
   state.glossary = terms;
   renderGlossary(q);
+}
+
+/** After any glossary change: the list, and the history that now has a new entry. */
+function glossaryChanged() {
+  return Promise.all([loadGlossary(), loadHistory()]);
+}
+
+function termPills(x) {
+  const pills = [];
+  if (x.case_sensitive) pills.push(`<span class="pill" title="${esc(t("glossary.case_title"))}">Aa</span>`);
+  if (x.conditional) pills.push(`<span class="pill pill-cond" title="${esc(t("glossary.cond_title"))}">${esc(t("glossary.cond_pill"))}</span>`);
+  if (x.warn?.length) pills.push(`<span class="pill pill-warn" title="${esc(x.warn.map((w) => t("warn." + w)).join(" "))}">${esc(t("glossary.warn_pill"))}</span>`);
+  return pills.length ? " " + pills.join(" ") : "";
 }
 
 function renderGlossary(q) {
@@ -398,13 +347,13 @@ function renderGlossary(q) {
       ];
       await api("/api/glossary/bulk", { method: "POST", body: { terms: examples.map((x) => ({ ...x, target_lang: "zh-CN" })) } });
       toast(t("glossary.examples_added"));
-      loadGlossary();
+      glossaryChanged();
     });
     return;
   }
   $("#glossary-list").innerHTML = `<table class="glossary-table"><thead><tr><th>${esc(t("glossary.col_term"))}</th><th>${esc(t("glossary.col_translation"))}</th><th>${esc(t("glossary.col_language"))}</th><th>${esc(t("glossary.col_note"))}</th><th class="num">${esc(t("glossary.col_used"))}</th><th><span class="sr-only">${esc(t("glossary.col_actions"))}</span></th></tr></thead><tbody>${
     terms.map((x) => `<tr data-id="${x.id}">
-      <td class="src"><mark class="term">${esc(x.source)}</mark>${x.case_sensitive ? ` <span class="pill" title="${esc(t("glossary.case_title"))}">Aa</span>` : ""}</td>
+      <td class="src"><mark class="term${x.conditional ? " cond" : ""}">${esc(x.source)}</mark>${termPills(x)}</td>
       <td class="tgt">${esc(x.target)}</td>
       <td class="muted">${esc(langName(x.target_lang))}</td>
       <td class="muted small">${esc(x.note)}</td>
@@ -425,7 +374,7 @@ $("#glossary-list").addEventListener("click", async (e) => {
       if (!confirm(t("glossary.confirm_delete", { term: x.source }))) return;
       await api(`/api/glossary/${x.id}`, { method: "DELETE" });
       toast(t("glossary.deleted"));
-      loadGlossary();
+      glossaryChanged();
     } else if (edit) {
       const x = state.glossary.find((g) => g.id == edit.dataset.edit);
       const tr = edit.closest("tr");
@@ -433,7 +382,9 @@ $("#glossary-list").addEventListener("click", async (e) => {
       tr.innerHTML = `<td><input type="text" class="lang-text" name="source" value="${esc(x.source)}" aria-label="${esc(t("glossary.col_term"))}"></td>
         <td><input type="text" class="lang-text" name="target" value="${esc(x.target)}" aria-label="${esc(t("glossary.col_translation"))}"></td>
         <td><select name="target_lang" aria-label="${esc(t("glossary.col_language"))}">${langOptions(x.target_lang)}</select></td>
-        <td><input type="text" name="note" value="${esc(x.note)}" aria-label="${esc(t("glossary.col_note"))}"><label class="check small" style="margin-top:6px"><input type="checkbox" name="case_sensitive"${x.case_sensitive ? " checked" : ""}> ${esc(t("glossary.case_label"))}</label></td>
+        <td><input type="text" name="note" value="${esc(x.note)}" aria-label="${esc(t("glossary.col_note"))}" placeholder="${esc(t("glossary.note_ph"))}">
+          <label class="check small" style="margin-top:6px"><input type="checkbox" name="case_sensitive"${x.case_sensitive ? " checked" : ""}> ${esc(t("glossary.case_label"))}</label>
+          <label class="check small" style="margin-top:4px"><input type="checkbox" name="conditional"${x.conditional ? " checked" : ""}> ${esc(t("glossary.cond_label"))}</label></td>
         <td></td>
         <td class="actions"><button class="btn btn-primary" type="button" data-save="${x.id}">${esc(t("glossary.save"))}</button> <button class="btn-quiet btn" type="button" data-cancel>${esc(t("glossary.cancel"))}</button></td>`;
       $("input[name=target]", tr).focus();
@@ -442,11 +393,12 @@ $("#glossary-list").addEventListener("click", async (e) => {
       const body = {
         source: $("[name=source]", tr).value, target: $("[name=target]", tr).value,
         target_lang: $("[name=target_lang]", tr).value, note: $("[name=note]", tr).value,
-        case_sensitive: $("[name=case_sensitive]", tr).checked,
+        case_sensitive: $("[name=case_sensitive]", tr).checked, conditional: $("[name=conditional]", tr).checked,
       };
-      await api(`/api/glossary/${save.dataset.save}`, { method: "PUT", body });
-      toast(t("glossary.saved"));
-      loadGlossary();
+      if (await saveWithCheck(`/api/glossary/${save.dataset.save}`, "PUT", body)) {
+        toast(t("glossary.saved"));
+        glossaryChanged();
+      }
     } else if (cancel) {
       renderGlossary($("#glossary-search").value.trim());
     }
@@ -456,12 +408,17 @@ $("#glossary-list").addEventListener("click", async (e) => {
 $("#add-term").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.currentTarget;
+  const body = {
+    source: f.source.value, target: f.target.value, target_lang: f.target_lang.value, note: f.note.value,
+    case_sensitive: f.case_sensitive.checked, conditional: f.conditional.checked,
+  };
   try {
-    await api("/api/glossary", { method: "POST", body: { source: f.source.value, target: f.target.value, target_lang: f.target_lang.value, note: f.note.value } });
-    toast(t("glossary.added", { term: f.source.value.trim() }));
+    if (!(await saveWithCheck("/api/glossary", "POST", body))) return;
+    toast(t("glossary.added", { term: body.source.trim() }));
     f.source.value = ""; f.target.value = ""; f.note.value = "";
+    f.case_sensitive.checked = false; f.conditional.checked = false;
     f.source.focus();
-    loadGlossary();
+    glossaryChanged();
   } catch (err) { toast(err.message, true); }
 });
 
@@ -474,16 +431,143 @@ $("#import-file").addEventListener("change", async (e) => {
   try {
     const res = await api("/api/glossary/import", { method: "POST", body: { csv: await file.text() } });
     toast([tn("glossary.imported", res.added), res.skipped ? tn("glossary.skipped", res.skipped) : ""].join(" ").trim());
-    loadGlossary();
+    glossaryChanged();
   } catch (err) { toast(err.message, true); }
   e.target.value = "";
 });
 
+/* ---------- proposals from teammates ---------- */
+async function refreshProposals() {
+  const { proposals } = await api("/api/proposals");
+  state.proposals = proposals;
+  setPendingBadge(proposals.length);
+  if (state.view === "glossary") renderProposals();
+}
+
+function renderProposals() {
+  const list = state.proposals;
+  $("#proposals").hidden = !list.length;
+  if (!list.length) return;
+  $("#proposals-title").textContent = tn("proposal.title", list.length);
+  $("#proposal-list").innerHTML = list.map((p) => {
+    const who = p.name ? t("proposal.from", { name: p.name }) : t("proposal.from_anon");
+    const status = p.current
+      ? t("proposal.change", { current: p.current.target })
+      : t("proposal.new");
+    const warn = p.warn?.length ? ` <span class="pill pill-warn" title="${esc(p.warn.map((w) => t("warn." + w)).join(" "))}">${esc(t("glossary.warn_pill"))}</span>` : "";
+    const noteValue = p.current ? p.current.note : p.note;
+    return `<li data-pid="${p.id}">
+      <div class="proposal-main">
+        <div class="term-pair"><mark class="term">${esc(p.source)}</mark>${warn}<span class="arrow" aria-label="${esc(t("terms.becomes"))}">→</span><input type="text" class="lang-text proposal-target" value="${esc(p.target)}" data-p-target aria-label="${esc(t("glossary.col_translation"))}"></div>
+        <p class="small muted">${esc(status)} · ${esc(langName(p.target_lang))} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
+        ${p.note ? `<p class="proposal-reason"><span class="muted small">${esc(t("proposal.reason"))}</span> ${esc(p.note)}</p>` : ""}
+        <label class="field proposal-note"><span class="sr-only">${esc(t("proposal.note_label"))}</span><input type="text" data-p-note value="${esc(noteValue)}" maxlength="300" placeholder="${esc(t("proposal.note_label"))}"></label>
+      </div>
+      <div class="proposal-actions">
+        <button class="btn btn-primary" type="button" data-approve="${p.id}">${esc(t("proposal.approve"))}</button>
+        <button class="btn-quiet btn" type="button" data-reject="${p.id}">${esc(t("proposal.reject"))}</button>
+      </div>
+    </li>`;
+  }).join("");
+}
+
+$("#proposal-list").addEventListener("click", async (e) => {
+  const approve = e.target.closest("[data-approve]");
+  const reject = e.target.closest("[data-reject]");
+  if (!approve && !reject) return;
+  const li = e.target.closest("li");
+  const p = state.proposals.find((x) => x.id == li.dataset.pid);
+  try {
+    if (approve) {
+      const body = { target: $("[data-p-target]", li).value, note: $("[data-p-note]", li).value };
+      if (!(await saveWithCheck(`/api/proposals/${p.id}/approve`, "POST", body))) return;
+      toast(t("proposal.approved", { term: p.source }));
+    } else {
+      await api(`/api/proposals/${p.id}/reject`, { method: "POST" });
+      toast(t("proposal.rejected", { term: p.source }));
+    }
+    await Promise.all([refreshProposals(), glossaryChanged()]);
+  } catch (err) { toast(err.message, true); }
+});
+
+/* ---------- change history ---------- */
+async function loadHistory() {
+  const { groups } = await api("/api/glossary/history");
+  state.history = groups;
+  renderHistory();
+}
+
+function historyChanges(prev, next) {
+  const parts = [];
+  if (prev.source !== next.source) parts.push(`<del>${esc(prev.source)}</del> → <ins>${esc(next.source)}</ins>`);
+  if (prev.target !== next.target) parts.push(`<del class="lang-text">${esc(prev.target)}</del> → <ins class="lang-text">${esc(next.target)}</ins>`);
+  if (prev.target_lang !== next.target_lang) parts.push(`${esc(langName(prev.target_lang))} → ${esc(langName(next.target_lang))}`);
+  if (prev.note !== next.note) parts.push(esc(next.note ? t("history.note_set", { note: next.note }) : t("history.note_cleared")));
+  if (prev.case_sensitive !== next.case_sensitive) parts.push(esc(t(next.case_sensitive ? "history.case_on" : "history.case_off")));
+  if (prev.conditional !== next.conditional) parts.push(esc(t(next.conditional ? "history.cond_on" : "history.cond_off")));
+  return parts.join(" · ");
+}
+
+function historyLine(e) {
+  const term = (e.next || e.prev).source;
+  const pair = (s) => `<span class="term-pair"><mark class="term">${esc(s.source)}</mark><span class="arrow">→</span>${esc(s.target)}</span>`;
+  if (e.action === "add") return [t("history.added", { term }), pair(e.next)];
+  if (e.action === "delete") return [t("history.deleted", { term }), pair(e.prev)];
+  if (e.action === "edit") return [t("history.edited", { term }), historyChanges(e.prev, e.next)];
+  // undo: describe what it restored
+  if (!e.next) return [t("history.undo_removed", { term }), pair(e.prev)];
+  if (!e.prev) return [t("history.undo_restored", { term }), pair(e.next)];
+  return [t("history.undo_reverted", { term }), historyChanges(e.prev, e.next)];
+}
+
+function renderHistory() {
+  const groups = state.history;
+  const shown = state.historyAll ? groups : groups.slice(0, 8);
+  $("#history-more").hidden = groups.length <= 8;
+  $("#history-more").textContent = state.historyAll ? t("history.show_less") : t("history.show_more");
+  if (!groups.length) {
+    $("#history-list").innerHTML = `<p class="muted">${esc(t("history.empty"))}</p>`;
+    return;
+  }
+  $("#history-list").innerHTML = `<ul class="history-list">${shown.map((g) => {
+    let title, detail;
+    if (g.count > 1) {
+      const key = { import: "history.imported", bulk: "history.bulk", undo: "history.undid_many" }[g.kind] || "history.changed_many";
+      title = tn(key, g.count);
+      const names = g.entries.map((e) => (e.next || e.prev).source);
+      detail = esc(names.join(", ") + (g.count > names.length ? ", …" : ""));
+    } else {
+      [title, detail] = historyLine(g.entries[0]);
+    }
+    const origin = g.entries[0].origin.startsWith("proposal:")
+      ? (g.entries[0].origin.slice(9) ? t("history.via_proposal", { name: g.entries[0].origin.slice(9) }) : t("history.via_proposal_anon"))
+      : "";
+    const meta = [timeAgo(g.ts), origin].filter(Boolean).map(esc).join(" · ");
+    const action = g.undone
+      ? `<span class="pill">${esc(t("history.undone"))}</span>`
+      : `<button class="btn btn-quiet" type="button" data-undo="${g.id}">${esc(t("history.undo"))}</button>`;
+    return `<li${g.undone ? ' class="undone"' : ""}><div class="history-main"><p><strong>${esc(title)}</strong> <span class="muted small">${meta}</span></p>${detail ? `<p class="history-detail">${detail}</p>` : ""}</div><div>${action}</div></li>`;
+  }).join("")}</ul>`;
+}
+
+$("#history-more").addEventListener("click", () => { state.historyAll = !state.historyAll; renderHistory(); });
+
+$("#history-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-undo]");
+  if (!btn) return;
+  try {
+    const r = await api(`/api/glossary/history/${btn.dataset.undo}/undo`, { method: "POST" });
+    toast(tn("history.undone_toast", r.undone));
+    glossaryChanged();
+  } catch (err) { toast(err.message, true); }
+});
+
+/* ---------- AI suggestions from a sample ---------- */
 $("#suggest-btn").addEventListener("click", (e) => busy(e.currentTarget, t("suggest.busy"), async () => {
   $("#suggest-status").textContent = "";
   try {
     const { terms } = await api("/api/glossary/suggest", { method: "POST", body: { text: $("#suggest-text").value } });
-    state.suggestions = terms;
+    state.aiSuggestions = terms;
     $("#suggest-results").hidden = !terms.length;
     $("#suggest-status").textContent = terms.length ? tn("suggest.found", terms.length) : t("suggest.none");
     $("#suggest-list").innerHTML = terms.map((x, i) => `<li><label><input type="checkbox" data-sugg="${i}"${x.exists ? "" : " checked"}>
@@ -494,7 +578,7 @@ $("#suggest-btn").addEventListener("click", (e) => busy(e.currentTarget, t("sugg
 
 $("#suggest-add").addEventListener("click", async () => {
   const picked = $$("[data-sugg]").filter((c) => c.checked).map((c) => {
-    const x = state.suggestions[c.dataset.sugg];
+    const x = state.aiSuggestions[c.dataset.sugg];
     return { ...x, target: $(`[data-sugg-target="${c.dataset.sugg}"]`).value };
   });
   if (!picked.length) return toast(t("suggest.tick_one"), true);
@@ -503,7 +587,7 @@ $("#suggest-add").addEventListener("click", async () => {
     toast(tn("suggest.added", res.added));
     $("#suggest-results").hidden = true;
     $("#suggest-status").textContent = "";
-    loadGlossary();
+    glossaryChanged();
   } catch (err) { toast(err.message, true); }
 });
 
@@ -530,15 +614,18 @@ function renderTry() {
     failed ? tn("try.failed", failed) + " " + errorText({ code: r.error_code }) : "",
   ].filter(Boolean).join(" ");
   $("#try-output").innerHTML = `<p class="result-summary">${esc(summary)}</p>` + (failed ? rawDetails(r.error_raw) : "") + items.map((i) => {
-    const applied = i.terms.filter((x) => x.applied).length;
+    const must = i.terms.filter((x) => !x.conditional);
+    const cond = i.terms.length - must.length;
+    const applied = must.filter((x) => x.applied).length;
     const meta = [
       i.error_code ? `<span class="pill pill-failed">${esc(t("try.badge_failed"))}</span>` : "",
       i.cached ? `<span class="pill pill-memory">${esc(t("try.badge_memory"))}</span>` : "",
       i.direct ? `<span class="pill pill-memory">${esc(t("try.badge_glossary"))}</span>` : "",
-      i.terms.length && !i.direct ? `<span class="pill">${esc(i.terms.length === 1 && I18N[LANG]["try.badge_terms_one"] ? t("try.badge_terms_one", { applied: fmt(applied), total: fmt(i.terms.length) }) : t("try.badge_terms", { applied: fmt(applied), total: fmt(i.terms.length) }))}</span>` : "",
+      must.length && !i.direct ? `<span class="pill">${esc(must.length === 1 && I18N[LANG]["try.badge_terms_one"] ? t("try.badge_terms_one", { applied: fmt(applied), total: fmt(must.length) }) : t("try.badge_terms", { applied: fmt(applied), total: fmt(must.length) }))}</span>` : "",
+      cond ? `<span class="pill pill-cond">${esc(tn("try.badge_cond", cond))}</span>` : "",
     ].join("");
     const cls = i.error_code ? " failed" : (i.cached || i.direct ? " cached" : "");
-    return `<div class="para${cls}"><p class="src">${highlight(i.source, i.terms, "source")}</p>${i.error_code ? "" : `<p class="tgt">${highlight(i.text, i.terms, "target")}</p>`}${meta ? `<div class="meta">${meta}</div>` : ""}</div>`;
+    return `<div class="para${cls}"><p class="src">${highlight(i.source, i.terms, "source")}</p>${i.error_code ? "" : `<p class="tgt">${highlight(i.text, i.terms.filter((x) => x.applied), "target")}</p>`}${meta ? `<div class="meta">${meta}</div>` : ""}</div>`;
   }).join("");
 }
 
@@ -562,7 +649,7 @@ $("#try-form").addEventListener("submit", (e) => {
 async function loadSettings() {
   const s = await api("/api/settings");
   state.settings = s;
-  state.languages = s.languages;
+  LANG_FALLBACK = s.languages;
   state.presets = s.presets;
   fillLangSelects();
 }

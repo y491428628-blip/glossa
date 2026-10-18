@@ -11,7 +11,8 @@ STATIC = ROOT / "app" / "static"
 I18N = json.loads((STATIC / "i18n.json").read_text(encoding="utf-8"))
 LANGS = ["en", "zh-CN", "zh-TW", "ja", "ko", "vi"]
 NAMESPACES = ("lang", "auth", "setup", "login", "nav", "overview", "chart", "terms", "connect", "invite", "toast",
-              "recent", "source", "glossary", "example", "suggest", "try", "highlight", "settings", "err")
+              "recent", "source", "glossary", "example", "suggest", "try", "highlight", "settings", "err",
+              "warn", "history", "proposal", "member")
 
 
 def test_every_language_has_every_key():
@@ -35,14 +36,15 @@ def test_placeholders_match_english():
 
 
 def test_keys_used_in_the_page_exist():
-    html = (STATIC / "index.html").read_text(encoding="utf-8")
-    js = (STATIC / "app.js").read_text(encoding="utf-8")
-    used = set(re.findall(r'data-i18n(?:-html|-ph|-aria)?="([\w.]+)"', html))
+    html = "".join((STATIC / f).read_text(encoding="utf-8") for f in ("index.html", "suggest.html"))
+    js = "".join((STATIC / f).read_text(encoding="utf-8") for f in ("i18n.js", "app.js", "member.js"))
+    used = set(re.findall(r'data-i18n(?:-html|-ph|-aria|-title)?="([\w.]+)"', html))
     used |= {k for k in re.findall(r'"([a-z]+\.[a-z0-9_]+)"', js) if k.split(".")[0] in NAMESPACES}
     used |= {f"source.{s}" for s in ("immersive", "openai", "dashboard")}
+    used |= {f"warn.{w}" for w in ("short", "common", "broad")}  # built from the server's warning codes
     missing = sorted(k for k in used if k not in I18N["en"])
     assert not missing, missing
-    assert len(used) > 150
+    assert len(used) > 220
 
 
 def test_every_error_code_is_translated_and_declared():
