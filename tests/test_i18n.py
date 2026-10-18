@@ -40,7 +40,7 @@ def test_keys_used_in_the_page_exist():
     js = "".join((STATIC / f).read_text(encoding="utf-8") for f in ("i18n.js", "app.js", "member.js"))
     used = set(re.findall(r'data-i18n(?:-html|-ph|-aria|-title)?="([\w.]+)"', html))
     used |= {k for k in re.findall(r'"([a-z]+\.[a-z0-9_]+)"', js) if k.split(".")[0] in NAMESPACES}
-    used |= {f"source.{s}" for s in ("immersive", "openai", "dashboard")}
+    used |= {f"source.{s}" for s in ("immersive", "openai", "dashboard", "member")}
     used |= {f"warn.{w}" for w in ("short", "common", "broad")}  # built from the server's warning codes
     missing = sorted(k for k in used if k not in I18N["en"])
     assert not missing, missing

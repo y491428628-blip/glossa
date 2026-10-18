@@ -524,14 +524,24 @@ def create_app() -> FastAPI:
         cid = client_id(request)
         if PROPOSAL_LIMITER.blocked(cid):
             raise AppError(429, "too_many_proposals", "Too many suggestions from this device. Try again later.")
-        t = clean_term({**payload, "conditional": False, "case_sensitive": False}, db)
+        kind = "remove" if payload.get("kind") == "remove" else "term"
+        if kind == "remove":
+            # Only an existing term can be suggested for removal; no translation is needed.
+            lang = canon(payload.get("target_lang") or load_settings(db).default_target_lang)
+            current = existing_for(db, str(payload.get("source", "")).strip(), lang)
+            if not current:
+                raise AppError(404, "term_not_found", "Term not found.")
+            t = {"source": current["source"], "target": current["target"], "target_lang": lang,
+                 "note": str(payload.get("note", "")).strip()[:300]}
+        else:
+            t = clean_term({**payload, "conditional": False, "case_sensitive": False}, db)
         name = str(payload.get("name", "")).strip()
         if len(name) > 40:
             raise AppError(400, "name_too_long", "Keep your name under 40 characters.", max=40)
         if db.count_pending_proposals() >= MAX_PENDING_PROPOSALS:
             raise AppError(429, "proposals_full", "Too many suggestions are waiting for review.")
         PROPOSAL_LIMITER.fail(cid)  # counts towards the hourly limit
-        pid = db.add_proposal(t["source"], t["target"], t["target_lang"], t["note"], name, cid)
+        pid = db.add_proposal(t["source"], t["target"], t["target_lang"], t["note"], name, cid, kind)
         return {"ok": True, "id": pid}
 
     def existing_for(db: Database, source: str, target_lang: str) -> dict | None:
@@ -564,6 +574,12 @@ def create_app() -> FastAPI:
     async def approve_proposal(proposal_id: int, payload: dict = Body(default={}), db: Database = Depends(db_dep)):
         p = pending(db, proposal_id)
         current = existing_for(db, p["source"], p["target_lang"])
+        if p["kind"] == "remove":
+            # Recorded in the history like any deletion, so it can be undone.
+            if current:
+                db.delete_term(current["id"], origin=f"proposal:{p['name']}")
+            db.decide_proposal(proposal_id, "approved", current["id"] if current else 0)
+            return {"removed": bool(current)}
         t = clean_term({
             # An existing term keeps its spelling and settings; the proposal changes the translation.
             "source": current["source"] if current else p["source"],
@@ -596,14 +612,23 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ try it / cache / stats
     @app.post("/api/translate", dependencies=[Depends(admin_dep)])
     async def try_translate(payload: dict = Body(...), db: Database = Depends(db_dep)):
+        return await try_it(db, payload, "dashboard", 20000)
+
+    @app.post("/api/team/translate")
+    async def team_try_translate(request: Request, db: Database = Depends(db_dep)):
+        """Try it on the teammate page. Same glossary, memory and rate limit as the extension."""
+        require_team_key(request, db)
+        return await try_it(db, await read_json(request), "member", 5000)
+
+    async def try_it(db: Database, payload: dict, endpoint: str, max_chars: int) -> dict:
         text = str(payload.get("text", ""))
         if not text.strip():
             raise AppError(400, "text_required", "Type or paste something to translate.")
-        if len(text) > 20000:
-            raise AppError(413, "text_too_long", "Keep the sample under 20,000 characters.", max=20000)
+        if len(text) > max_chars:
+            raise AppError(413, "text_too_long", f"Keep the sample under {max_chars} characters.", max=max_chars)
         paragraphs = text.split("\n")
         started = time.perf_counter()
-        outcome = await translate_texts(db, paragraphs, payload.get("target_lang"), "dashboard")
+        outcome = await translate_texts(db, paragraphs, payload.get("target_lang"), endpoint)
         err = outcome.first_error
         if err and all(i.error or i.skipped for i in outcome.items):
             raise err  # nothing came back at all

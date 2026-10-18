@@ -67,6 +67,33 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/** Wrap glossary terms in <mark>, escaping everything else. Source side also matches plural endings. */
+function highlight(text, terms, side) {
+  const list = (terms || [])
+    .map((term) => ({ word: side === "source" ? term.source : term.target, applied: term.applied !== false, conditional: Boolean(term.conditional) }))
+    .filter((x) => x.word)
+    .sort((a, b) => b.word.length - a.word.length);
+  if (!list.length) return esc(text);
+  const toPattern = (w) => {
+    const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[\s\-]+/g, "[\\s\\-]+");
+    return side === "source" && /[A-Za-z]$/.test(w) ? escaped + "(?:s|es|'s)?" : escaped;
+  };
+  const pattern = new RegExp(list.map((x) => toPattern(x.word)).join("|"), "gi");
+  let out = "", last = 0, m;
+  while ((m = pattern.exec(text))) {
+    if (!m[0]) { pattern.lastIndex++; continue; }
+    const norm = (s) => s.toLowerCase().replace(/[\s\-]+/g, " ");
+    const hit = list.find((x) => norm(m[0]).startsWith(norm(x.word)));
+    out += esc(text.slice(last, m.index));
+    const missed = side === "source" && hit && !hit.applied && !hit.conditional;
+    const cls = "term" + (missed ? " missed" : "") + (hit && hit.conditional ? " cond" : "");
+    const title = missed ? t("highlight.missed") : (hit && hit.conditional ? t("highlight.cond") : "");
+    out += `<mark class="${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(m[0])}</mark>`;
+    last = m.index + m[0].length;
+  }
+  return out + esc(text.slice(last));
+}
+
 function applyStatic() {
   document.documentElement.lang = LANG;
   $$("[data-i18n]").forEach((el) => (el.textContent = t(el.dataset.i18n)));
@@ -81,7 +108,7 @@ function applyStatic() {
 
 async function loadI18n() {
   try {
-    const res = await fetch("/static/i18n.json?v=0.3.0");
+    const res = await fetch("/static/i18n.json?v=0.3.1");
     I18N = await res.json();
   } catch { /* keep the built-in English fallback */ }
   const saved = storedLang();

@@ -91,7 +91,8 @@ CREATE TABLE IF NOT EXISTS proposals (
     client      TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
     decided_at  REAL,
-    term_id     INTEGER NOT NULL DEFAULT 0
+    term_id     INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT NOT NULL DEFAULT 'term'       -- term (add or change) | remove
 );
 
 CREATE TABLE IF NOT EXISTS cache (
@@ -146,6 +147,9 @@ MIGRATIONS = {
     },
     "glossary": {
         "conditional": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "proposals": {
+        "kind": "TEXT NOT NULL DEFAULT 'term'",
     },
 }
 
@@ -281,12 +285,12 @@ class Database:
             self.bump_glossary_version()
         return row
 
-    def delete_term(self, term_id: int) -> bool:
+    def delete_term(self, term_id: int, origin: str = "") -> bool:
         prev = term_state(self.get_term(term_id))
         if prev is None:
             return False
         self.execute("DELETE FROM glossary WHERE id = ?", (term_id,))
-        self._record("delete", term_id, prev, None)
+        self._record("delete", term_id, prev, None, origin=origin)
         self.bump_glossary_version()
         return True
 
@@ -379,22 +383,32 @@ class Database:
         return len(group)
 
     # -- proposals from teammates ----------------------------------------------------------
-    def add_proposal(self, source: str, target: str, target_lang: str, note: str, name: str, client: str) -> int:
-        same = self.query_one(
-            "SELECT id FROM proposals WHERE status = 'pending' AND lower(source) = lower(?) AND target_lang = ? "
-            "AND target = ?",
-            (source, target_lang, target),
-        )
+    def add_proposal(self, source: str, target: str, target_lang: str, note: str, name: str, client: str,
+                     kind: str = "term") -> int:
+        """kind 'term' adds or changes a term; 'remove' asks for it to be deleted. Duplicates are kept once."""
+        if kind == "remove":
+            same = self.query_one(
+                "SELECT id FROM proposals WHERE status = 'pending' AND kind = 'remove' AND lower(source) = lower(?) "
+                "AND target_lang = ?",
+                (source, target_lang),
+            )
+        else:
+            same = self.query_one(
+                "SELECT id FROM proposals WHERE status = 'pending' AND kind = 'term' AND lower(source) = lower(?) "
+                "AND target_lang = ? AND target = ?",
+                (source, target_lang, target),
+            )
         if same:
             return same["id"]
         cur = self.execute(
-            "INSERT INTO proposals (ts, source, target, target_lang, note, name, client) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), source, target, target_lang, note, name, client),
+            "INSERT INTO proposals (ts, source, target, target_lang, note, name, client, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), source, target, target_lang, note, name, client, kind),
         )
         return int(cur.lastrowid or 0)
 
     def pending_proposals(self) -> list[dict]:
-        return self.query("SELECT id, ts, source, target, target_lang, note, name FROM proposals "
+        return self.query("SELECT id, ts, kind, source, target, target_lang, note, name FROM proposals "
                           "WHERE status = 'pending' ORDER BY id")
 
     def count_pending_proposals(self) -> int:

@@ -55,33 +55,6 @@ async function busy(btn, label, fn) {
   try { return await fn(); } finally { btn.disabled = false; btn.textContent = original; }
 }
 
-/** Wrap glossary terms in <mark>, escaping everything else. Source side also matches plural endings. */
-function highlight(text, terms, side) {
-  const list = (terms || [])
-    .map((term) => ({ word: side === "source" ? term.source : term.target, applied: term.applied !== false, conditional: Boolean(term.conditional) }))
-    .filter((x) => x.word)
-    .sort((a, b) => b.word.length - a.word.length);
-  if (!list.length) return esc(text);
-  const toPattern = (w) => {
-    const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[\s\-]+/g, "[\\s\\-]+");
-    return side === "source" && /[A-Za-z]$/.test(w) ? escaped + "(?:s|es|'s)?" : escaped;
-  };
-  const pattern = new RegExp(list.map((x) => toPattern(x.word)).join("|"), "gi");
-  let out = "", last = 0, m;
-  while ((m = pattern.exec(text))) {
-    if (!m[0]) { pattern.lastIndex++; continue; }
-    const norm = (s) => s.toLowerCase().replace(/[\s\-]+/g, " ");
-    const hit = list.find((x) => norm(m[0]).startsWith(norm(x.word)));
-    out += esc(text.slice(last, m.index));
-    const missed = side === "source" && hit && !hit.applied && !hit.conditional;
-    const cls = "term" + (missed ? " missed" : "") + (hit && hit.conditional ? " cond" : "");
-    const title = missed ? t("highlight.missed") : (hit && hit.conditional ? t("highlight.cond") : "");
-    out += `<mark class="${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(m[0])}</mark>`;
-    last = m.index + m[0].length;
-  }
-  return out + esc(text.slice(last));
-}
-
 function langOptions(selected) {
   return Object.keys(LANG_FALLBACK)
     .map((code) => `<option value="${esc(code)}"${code === selected ? " selected" : ""}>${esc(langName(code))}</option>`)
@@ -455,12 +428,29 @@ function renderProposals() {
       ? t("proposal.change", { current: p.current.target })
       : t("proposal.new");
     const warn = p.warn?.length ? ` <span class="pill pill-warn" title="${esc(p.warn.map((w) => t("warn." + w)).join(" "))}">${esc(t("glossary.warn_pill"))}</span>` : "";
+    const reason = p.note ? `<p class="proposal-reason"><span class="muted small">${esc(t("proposal.reason"))}</span> ${esc(p.note)}</p>` : "";
+    if (p.kind === "remove") {
+      const current = p.current
+        ? `<span class="term-pair"><mark class="term">${esc(p.current.source)}</mark><span class="arrow">→</span>${esc(p.current.target)}</span>`
+        : `<mark class="term">${esc(p.source)}</mark> <span class="muted small">${esc(t("proposal.remove_gone"))}</span>`;
+      return `<li data-pid="${p.id}" class="proposal-remove">
+        <div class="proposal-main">
+          <div class="proposal-head"><span class="pill pill-remove">${esc(t("proposal.remove_pill"))}</span>${current}${warn}</div>
+          <p class="small muted">${esc(langName(p.target_lang))} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
+          ${reason}
+        </div>
+        <div class="proposal-actions">
+          <button class="btn btn-danger" type="button" data-approve="${p.id}">${esc(t("proposal.approve_remove"))}</button>
+          <button class="btn-quiet btn" type="button" data-reject="${p.id}">${esc(t("proposal.reject"))}</button>
+        </div>
+      </li>`;
+    }
     const noteValue = p.current ? p.current.note : p.note;
     return `<li data-pid="${p.id}">
       <div class="proposal-main">
         <div class="term-pair"><mark class="term">${esc(p.source)}</mark>${warn}<span class="arrow" aria-label="${esc(t("terms.becomes"))}">→</span><input type="text" class="lang-text proposal-target" value="${esc(p.target)}" data-p-target aria-label="${esc(t("glossary.col_translation"))}"></div>
         <p class="small muted">${esc(status)} · ${esc(langName(p.target_lang))} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
-        ${p.note ? `<p class="proposal-reason"><span class="muted small">${esc(t("proposal.reason"))}</span> ${esc(p.note)}</p>` : ""}
+        ${reason}
         <label class="field proposal-note"><span class="sr-only">${esc(t("proposal.note_label"))}</span><input type="text" data-p-note value="${esc(noteValue)}" maxlength="300" placeholder="${esc(t("proposal.note_label"))}"></label>
       </div>
       <div class="proposal-actions">
@@ -478,7 +468,10 @@ $("#proposal-list").addEventListener("click", async (e) => {
   const li = e.target.closest("li");
   const p = state.proposals.find((x) => x.id == li.dataset.pid);
   try {
-    if (approve) {
+    if (approve && p.kind === "remove") {
+      await api(`/api/proposals/${p.id}/approve`, { method: "POST", body: {} });
+      toast(t("proposal.removed", { term: p.source }));  // undoable from the change history
+    } else if (approve) {
       const body = { target: $("[data-p-target]", li).value, note: $("[data-p-note]", li).value };
       if (!(await saveWithCheck(`/api/proposals/${p.id}/approve`, "POST", body))) return;
       toast(t("proposal.approved", { term: p.source }));

@@ -9,7 +9,7 @@ Glossa sits between your team's [Immersive Translate](https://immersivetranslate
 - **Bring your own AI.** Works with any OpenAI-compatible API (OpenAI, DeepSeek, Gemini, OpenRouter, Groq and more). Your key stays on your server.
 - **Stays under your rate limit.** Paragraphs arriving together are merged into a few AI calls, calls are queued under a requests-per-minute limit you set, and rate-limit or outage errors are retried automatically.
 - **Safe to edit.** Very short, everyday or very broad terms need a second click, with examples of what they would change. Every change is in a history with one-click undo. Terms with several meanings can be marked *depends on meaning*: the note tells the AI when the translation applies, and it is never forced.
-- **Teammates can suggest terms.** A page that only needs the team key shows the glossary and takes suggestions; the admin approves each one before it is used.
+- **Teammates can suggest terms.** A page that only needs the team key shows the glossary, lets teammates try a sentence, and takes suggestions to add, change or remove a term; the admin approves each one before it is used.
 - **Dashboard in six languages.** English, 简体中文, 繁體中文, 日本語, 한국어 and Tiếng Việt. Manage the glossary, let the AI suggest terms from a sample, try translations side by side, and see how much the memory has saved.
 
 Nobody has to change how they read: teammates keep using Immersive Translate and only change one setting.
@@ -50,7 +50,7 @@ Every paragraph is cached on its own, keyed on text + language + model + the glo
 
 ## Teammate suggestions
 
-Overview → **Suggestions from teammates** has a link of the form `https://<your-glossa-address>/suggest#key=<team key>` (the setup message includes it too). Teammates can browse the glossary there and suggest a new term or a better translation. Suggestions wait under **Glossary** until the admin approves or rejects them.
+Overview → **Suggestions from teammates** has a link of the form `https://<your-glossa-address>/suggest#key=<team key>` (the setup message includes it too). Teammates can browse the glossary there, try a sentence, and suggest a new term, a better translation or removing a term. Suggestions wait under **Glossary** until the admin approves or rejects them.
 
 ## API
 
@@ -60,7 +60,8 @@ Overview → **Suggestions from teammates** has a link of the form `https://<you
 | `POST /imme` | `?token=<team key>` or bearer | Immersive Translate custom API: `{source_lang, target_lang, text_list}` → `{translations: [{detected_source_lang, text}]}` |
 | `GET /v1/models` | team key | Lists the configured model |
 | `GET /api/team/glossary` | team key | The glossary, read-only, for the teammate page |
-| `POST /api/team/proposals` | team key | Suggest a term: `{source, target, target_lang, note, name}` (30 per hour per address) |
+| `POST /api/team/proposals` | team key | Suggest a term `{source, target, target_lang, note, name}`, or its removal `{kind: "remove", source, target_lang, note, name}` (30 per hour per address) |
+| `POST /api/team/translate` | team key | Try it for teammates: `{text, target_lang}`, up to 5,000 characters |
 | `GET /healthz` | none | Health check |
 | `/api/*` | admin session | Dashboard API (glossary, history and undo, proposals, settings, stats, try-it) |
 

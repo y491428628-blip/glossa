@@ -68,7 +68,7 @@ def test_setup_login_flow(client):
     assert r.status_code == 401 and r.json()["code"] == "not_signed_in"
     setup_admin(client)
     assert client.get("/api/me").json() == {
-        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.3.0",
+        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.3.1",
     }
     client.post("/api/logout")
     r = client.post("/api/login", json={"password": "nope"})
@@ -505,6 +505,50 @@ def test_teammates_propose_and_admin_reviews(client):
     assert latest["origin"] == "proposal:Amy" and latest["prev"]["target"] == "人口普查日"
 
 
+def test_teammates_can_suggest_removing_a_term(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "date", "target": "日期", "force": True})  # a bad term
+    h = {"Authorization": f"Bearer {key}"}
+    r = client.post("/api/team/proposals", headers=h, json={"kind": "remove", "source": "Date",
+                                                           "note": "Too common, it breaks other sentences", "name": "Amy"})
+    pid = r.json()["id"]
+    again = client.post("/api/team/proposals", headers=h, json={"kind": "remove", "source": "date"}).json()["id"]
+    assert again == pid  # no translation needed, and a repeat is kept once
+    r = client.post("/api/team/proposals", headers=h, json={"kind": "remove", "source": "no such term"})
+    assert r.status_code == 404 and r.json()["code"] == "term_not_found"
+
+    p = client.get("/api/proposals").json()["proposals"][0]
+    assert p["kind"] == "remove" and p["current"]["target"] == "日期"
+    assert client.post(f"/api/proposals/{pid}/approve", json={}).json() == {"removed": True}
+    assert client.get("/api/glossary").json()["terms"] == []
+    entry = client.get("/api/glossary/history").json()["groups"][0]["entries"][0]
+    assert entry["action"] == "delete" and entry["origin"] == "proposal:Amy"
+    # Removed by mistake? The admin can undo it like any other change.
+    client.post(f"/api/glossary/history/{entry['id']}/undo")
+    assert [t["source"] for t in client.get("/api/glossary").json()["terms"]] == ["date"]
+
+
+def test_teammates_can_try_translations(client):
+    key = setup_admin(client)
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    h = {"Authorization": f"Bearer {key}"}
+    client.post("/api/logout")  # teammates have no admin session
+    assert client.post("/api/team/translate", json={"text": "The census date"}).status_code == 401
+    r = client.post("/api/team/translate", headers=h, json={"text": "The census date is Sunday.\nKey dates"})
+    assert r.status_code == 200, r.text
+    first = r.json()["items"][0]
+    assert first["text"] == "[ZH] The 退课截止日 is Sunday."
+    assert first["terms"] == [{"source": "census date", "target": "退课截止日", "applied": True, "conditional": False}]
+    # Same memory as the extension: a page a teammate already read costs nothing here.
+    imme(client, key, ["Student News"])
+    item = client.post("/api/team/translate", headers=h, json={"text": "Student News"}).json()["items"][0]
+    assert item["cached"] is True
+    r = client.post("/api/team/translate", headers=h, json={"text": "x" * 5001})
+    assert r.status_code == 413 and r.json()["params"] == {"max": 5000}
+    client.post("/api/login", json={"password": "correct-horse"})
+    assert [r["endpoint"] for r in client.get("/api/stats").json()["recent"]] == ["member", "immersive", "member"]
+
+
 def test_proposals_are_rate_limited(client, monkeypatch):
     from app import main as mainmod
 
@@ -565,6 +609,22 @@ def test_upgrade_from_v2_glossary(tmp_path):
     assert row["conditional"] == 0 and row["target"] == "退课截止日"
     database.update_term(row["id"], target="截止日")
     assert database.list_history()[0]["entries"][0]["prev"]["target"] == "退课截止日"
+
+
+def test_upgrade_from_v3_proposals(tmp_path):
+    path = tmp_path / "v3.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE proposals (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, source TEXT NOT NULL, "
+        "target TEXT NOT NULL, target_lang TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', "
+        "client TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', decided_at REAL, "
+        "term_id INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO proposals (ts, source, target, target_lang) VALUES (1, 'tutorial', '辅导课', 'zh-CN');"
+    )
+    con.commit()
+    con.close()
+    database = dbmod.Database(path)
+    assert database.pending_proposals()[0]["kind"] == "term"
 
 
 def test_healthz_and_index(client):
