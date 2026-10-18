@@ -13,11 +13,14 @@ from typing import Any, Iterable
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 
-TERM_FIELDS = ("source", "target", "target_lang", "note", "case_sensitive", "conditional")
+TERM_FIELDS = ("source", "target", "target_lang", "note", "case_sensitive", "conditional", "set_id", "enabled")
+GENERAL_SET = 1     # built-in set every term starts in
+DEFAULT_LINK = 1    # the plain /v1/... address
 
 
 def term_state(row: Any) -> dict | None:
-    """The user-editable part of a glossary row, used to compare and restore versions."""
+    """The user-editable part of a glossary row, used to compare and restore versions.
+    Also normalises history saved by older versions, which had no set or enabled flag."""
     if not row:
         return None
     row = dict(row)
@@ -28,6 +31,8 @@ def term_state(row: Any) -> dict | None:
         "note": row.get("note") or "",
         "case_sensitive": int(bool(row.get("case_sensitive"))),
         "conditional": int(bool(row.get("conditional"))),
+        "set_id": int(row.get("set_id") or GENERAL_SET),
+        "enabled": int(bool(row.get("enabled", 1))),
     }
 
 
@@ -36,7 +41,7 @@ def _dump(state: dict | None) -> str:
 
 
 def _load(text: str) -> dict | None:
-    return json.loads(text) if text else None
+    return term_state(json.loads(text)) if text else None
 
 
 class HistoryConflict(Exception):
@@ -47,12 +52,7 @@ class HistoryConflict(Exception):
         self.code = code
         self.term = term
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
+GLOSSARY_TABLE = """
 CREATE TABLE IF NOT EXISTS glossary (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     source         TEXT NOT NULL,
@@ -61,10 +61,39 @@ CREATE TABLE IF NOT EXISTS glossary (
     note           TEXT NOT NULL DEFAULT '',
     case_sensitive INTEGER NOT NULL DEFAULT 0,
     conditional    INTEGER NOT NULL DEFAULT 0,   -- 1: the AI decides from the note whether the term applies
+    set_id         INTEGER NOT NULL DEFAULT 1,
+    enabled        INTEGER NOT NULL DEFAULT 1,   -- 0: temporarily off, kept with its history
     hit_count      INTEGER NOT NULL DEFAULT 0,
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL,
-    UNIQUE (source, target_lang)
+    UNIQUE (set_id, source, target_lang)
+)
+"""
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS glossary_sets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL DEFAULT '',     -- '' is the built-in General set
+    position   INTEGER NOT NULL DEFAULT 0,   -- lower wins when two sets in one link have the same term
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL DEFAULT '',     -- '' is the default link (the plain /v1/... address)
+    slug       TEXT NOT NULL UNIQUE,         -- '' for the default link, otherwise /g/<slug>/v1/...
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS link_sets (
+    link_id INTEGER NOT NULL,
+    set_id  INTEGER NOT NULL,
+    PRIMARY KEY (link_id, set_id)
 );
 
 CREATE TABLE IF NOT EXISTS glossary_history (
@@ -92,7 +121,8 @@ CREATE TABLE IF NOT EXISTS proposals (
     status      TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
     decided_at  REAL,
     term_id     INTEGER NOT NULL DEFAULT 0,
-    kind        TEXT NOT NULL DEFAULT 'term'       -- term (add or change) | remove
+    kind        TEXT NOT NULL DEFAULT 'term',      -- term (add or change) | remove
+    set_id      INTEGER NOT NULL DEFAULT 1         -- the set the change goes into
 );
 
 CREATE TABLE IF NOT EXISTS cache (
@@ -145,11 +175,9 @@ MIGRATIONS = {
         "glossary_direct": "INTEGER NOT NULL DEFAULT 0",
         "error_code": "TEXT NOT NULL DEFAULT ''",
     },
-    "glossary": {
-        "conditional": "INTEGER NOT NULL DEFAULT 0",
-    },
     "proposals": {
         "kind": "TEXT NOT NULL DEFAULT 'term'",
+        "set_id": "INTEGER NOT NULL DEFAULT 1",
     },
 }
 
@@ -170,7 +198,36 @@ class Database:
                 for name, decl in columns.items():
                     if name not in existing:
                         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            self._upgrade_glossary()
+            now = time.time()
+            self._conn.execute("INSERT OR IGNORE INTO glossary_sets (id, name, position, created_at) VALUES (?, '', 0, ?)",
+                               (GENERAL_SET, now))
+            self._conn.execute("INSERT OR IGNORE INTO links (id, name, slug, created_at) VALUES (?, '', '', ?)",
+                               (DEFAULT_LINK, now))
+            if not self._conn.execute("SELECT 1 FROM link_sets WHERE link_id = ?", (DEFAULT_LINK,)).fetchone():
+                self._conn.execute("INSERT INTO link_sets (link_id, set_id) VALUES (?, ?)", (DEFAULT_LINK, GENERAL_SET))
             self._conn.commit()
+
+    def _upgrade_glossary(self) -> None:
+        """v0.4 makes a term unique per set. SQLite cannot change a UNIQUE constraint in place, so a
+        glossary from an older version is copied into a new table. Ids are kept, so history still points
+        at the right terms; every existing term goes into the General set, enabled."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(glossary)")}
+        if not cols:
+            self._conn.execute(GLOSSARY_TABLE)  # new database
+            return
+        if "set_id" in cols:
+            return
+        conditional = "conditional" if "conditional" in cols else "0"
+        self._conn.execute("ALTER TABLE glossary RENAME TO glossary_v3")
+        self._conn.execute(GLOSSARY_TABLE)
+        self._conn.execute(
+            "INSERT INTO glossary (id, source, target, target_lang, note, case_sensitive, conditional, set_id, "
+            "enabled, hit_count, created_at, updated_at) "
+            f"SELECT id, source, target, target_lang, note, case_sensitive, {conditional}, {GENERAL_SET}, 1, "
+            "hit_count, created_at, updated_at FROM glossary_v3"
+        )
+        self._conn.execute("DROP TABLE glossary_v3")
 
     # -- low level -----------------------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -215,21 +272,24 @@ class Database:
     def glossary_version(self) -> int:
         return int(self.get_setting("glossary_version", "0") or 0)
 
-    def list_glossary(self, q: str = "") -> list[dict]:
+    def list_glossary(self, q: str = "", set_id: int | None = None) -> list[dict]:
+        where, params = [], []
         if q:
             like = f"%{q}%"
-            return self.query(
-                "SELECT * FROM glossary WHERE source LIKE ? OR target LIKE ? OR note LIKE ? "
-                "ORDER BY lower(source)",
-                (like, like, like),
-            )
-        return self.query("SELECT * FROM glossary ORDER BY lower(source)")
+            where.append("(source LIKE ? OR target LIKE ? OR note LIKE ?)")
+            params += [like, like, like]
+        if set_id:
+            where.append("set_id = ?")
+            params.append(set_id)
+        sql = "SELECT * FROM glossary" + (" WHERE " + " AND ".join(where) if where else "")
+        return self.query(sql + " ORDER BY lower(source), set_id", params)
 
     def get_term(self, term_id: int) -> dict | None:
         return self.query_one("SELECT * FROM glossary WHERE id = ?", (term_id,))
 
-    def find_term(self, source: str, target_lang: str) -> dict | None:
-        return self.query_one("SELECT * FROM glossary WHERE source = ? AND target_lang = ?", (source, target_lang))
+    def find_term(self, source: str, target_lang: str, set_id: int = GENERAL_SET) -> dict | None:
+        return self.query_one("SELECT * FROM glossary WHERE set_id = ? AND source = ? AND target_lang = ?",
+                              (set_id, source, target_lang))
 
     def _record(self, action: str, term_id: int, prev: dict | None, nxt: dict | None,
                 batch: str = "", origin: str = "") -> None:
@@ -247,20 +307,22 @@ class Database:
         note: str = "",
         case_sensitive: bool = False,
         conditional: bool = False,
+        set_id: int = GENERAL_SET,
+        enabled: bool = True,
         batch: str = "",
         origin: str = "",
     ) -> dict:
-        prev = term_state(self.find_term(source, target_lang))
+        prev = term_state(self.find_term(source, target_lang, set_id))
         now = time.time()
         self.execute(
-            "INSERT INTO glossary (source, target, target_lang, note, case_sensitive, conditional, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(source, target_lang) DO UPDATE SET target = excluded.target, note = excluded.note, "
+            "INSERT INTO glossary (source, target, target_lang, note, case_sensitive, conditional, set_id, enabled, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(set_id, source, target_lang) DO UPDATE SET target = excluded.target, note = excluded.note, "
             "case_sensitive = excluded.case_sensitive, conditional = excluded.conditional, "
-            "updated_at = excluded.updated_at",
-            (source, target, target_lang, note, int(case_sensitive), int(conditional), now, now),
+            "enabled = excluded.enabled, updated_at = excluded.updated_at",
+            (source, target, target_lang, note, int(case_sensitive), int(conditional), set_id, int(enabled), now, now),
         )
-        row: dict = self.find_term(source, target_lang)  # type: ignore[assignment]
+        row: dict = self.find_term(source, target_lang, set_id)  # type: ignore[assignment]
         nxt = term_state(row)
         if nxt != prev:
             self._record("edit" if prev else "add", row["id"], prev, nxt, batch, origin)
@@ -272,7 +334,7 @@ class Database:
         if prev is None:
             return None
         sets = {k: v for k, v in fields.items() if k in TERM_FIELDS and v is not None}
-        for flag in ("case_sensitive", "conditional"):
+        for flag in ("case_sensitive", "conditional", "enabled"):
             if flag in sets:
                 sets[flag] = int(bool(sets[flag]))
         if sets:
@@ -293,6 +355,96 @@ class Database:
         self._record("delete", term_id, prev, None, origin=origin)
         self.bump_glossary_version()
         return True
+
+    # -- glossary sets and links ------------------------------------------------------
+    # A set is a group of terms ("UNSW admin", "Statistics"). A link is an address the admin hands
+    # to a group of teammates; it decides which sets their translations use. When two sets in a
+    # link have the same term, the set listed first wins; General is always last.
+    SET_ORDER = "(id = 1), position, id"
+
+    def list_sets(self) -> list[dict]:
+        return self.query(
+            "SELECT s.id, s.name, s.position, (SELECT COUNT(*) FROM glossary g WHERE g.set_id = s.id) AS terms "
+            f"FROM glossary_sets s ORDER BY {self.SET_ORDER}"
+        )
+
+    def get_set(self, set_id: int) -> dict | None:
+        return self.query_one("SELECT * FROM glossary_sets WHERE id = ?", (set_id,))
+
+    def find_set_by_name(self, name: str) -> dict | None:
+        return self.query_one("SELECT * FROM glossary_sets WHERE lower(name) = lower(?)", (name,))
+
+    def add_set(self, name: str) -> dict:
+        pos = (self.query_one("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM glossary_sets") or {}).get("p", 1)
+        cur = self.execute("INSERT INTO glossary_sets (name, position, created_at) VALUES (?, ?, ?)",
+                           (name, pos, time.time()))
+        return self.get_set(int(cur.lastrowid or 0))  # type: ignore[return-value]
+
+    def rename_set(self, set_id: int, name: str) -> None:
+        self.execute("UPDATE glossary_sets SET name = ? WHERE id = ?", (name, set_id))
+
+    def move_set(self, set_id: int, direction: int) -> None:
+        """Swap with the neighbouring set (General stays last)."""
+        order = [r["id"] for r in self.list_sets() if r["id"] != GENERAL_SET]
+        if set_id not in order:
+            return
+        i = order.index(set_id)
+        j = i + direction
+        if 0 <= j < len(order):
+            order[i], order[j] = order[j], order[i]
+            with self._lock:
+                self._conn.executemany("UPDATE glossary_sets SET position = ? WHERE id = ?",
+                                       [(n + 1, sid) for n, sid in enumerate(order)])
+                self._conn.commit()
+            self.bump_glossary_version()
+
+    def delete_set(self, set_id: int) -> None:
+        self.execute("DELETE FROM link_sets WHERE set_id = ?", (set_id,))
+        self.execute("DELETE FROM glossary_sets WHERE id = ?", (set_id,))
+        self.bump_glossary_version()
+
+    def list_links(self) -> list[dict]:
+        links = self.query("SELECT id, name, slug FROM links ORDER BY (id != 1), id")
+        for link in links:
+            link["set_ids"] = self.link_set_ids(link["id"])
+        return links
+
+    def get_link(self, link_id: int) -> dict | None:
+        return self.query_one("SELECT id, name, slug FROM links WHERE id = ?", (link_id,))
+
+    def link_by_slug(self, slug: str) -> dict | None:
+        return self.query_one("SELECT id, name, slug FROM links WHERE slug = ?", (slug,))
+
+    def link_set_ids(self, link_id: int) -> list[int]:
+        """The link's sets in priority order."""
+        return [r["id"] for r in self.query(
+            f"SELECT s.id FROM glossary_sets s JOIN link_sets l ON l.set_id = s.id WHERE l.link_id = ? "
+            f"ORDER BY {self.SET_ORDER}", (link_id,))]
+
+    def add_link(self, name: str, set_ids: list[int]) -> dict:
+        slug = uuid.uuid4().hex[:8]
+        cur = self.execute("INSERT INTO links (name, slug, created_at) VALUES (?, ?, ?)", (name, slug, time.time()))
+        link_id = int(cur.lastrowid or 0)
+        self.set_link_sets(link_id, set_ids)
+        return self.get_link(link_id)  # type: ignore[return-value]
+
+    def update_link(self, link_id: int, name: str | None, set_ids: list[int] | None) -> None:
+        if name is not None:
+            self.execute("UPDATE links SET name = ? WHERE id = ?", (name, link_id))
+        if set_ids is not None:
+            self.set_link_sets(link_id, set_ids)
+
+    def set_link_sets(self, link_id: int, set_ids: list[int]) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM link_sets WHERE link_id = ?", (link_id,))
+            self._conn.executemany("INSERT OR IGNORE INTO link_sets (link_id, set_id) VALUES (?, ?)",
+                                   [(link_id, sid) for sid in set_ids])
+            self._conn.commit()
+        self.bump_glossary_version()
+
+    def delete_link(self, link_id: int) -> None:
+        self.execute("DELETE FROM link_sets WHERE link_id = ?", (link_id,))
+        self.execute("DELETE FROM links WHERE id = ?", (link_id,))
 
     # -- glossary history ------------------------------------------------------------
     def list_history(self, limit_groups: int = 40, entries_per_group: int = 3) -> list[dict]:
@@ -336,8 +488,8 @@ class Database:
         batch = f"undo-{uuid.uuid4().hex[:12]}" if len(group) > 1 else ""
 
         def fetch(conn: sqlite3.Connection, state: dict) -> dict | None:
-            row = conn.execute("SELECT * FROM glossary WHERE source = ? AND target_lang = ?",
-                               (state["source"], state["target_lang"])).fetchone()
+            row = conn.execute("SELECT * FROM glossary WHERE set_id = ? AND source = ? AND target_lang = ?",
+                               (state["set_id"], state["source"], state["target_lang"])).fetchone()
             return dict(row) if row else None
 
         with self._lock:
@@ -384,31 +536,31 @@ class Database:
 
     # -- proposals from teammates ----------------------------------------------------------
     def add_proposal(self, source: str, target: str, target_lang: str, note: str, name: str, client: str,
-                     kind: str = "term") -> int:
+                     kind: str = "term", set_id: int = GENERAL_SET) -> int:
         """kind 'term' adds or changes a term; 'remove' asks for it to be deleted. Duplicates are kept once."""
         if kind == "remove":
             same = self.query_one(
                 "SELECT id FROM proposals WHERE status = 'pending' AND kind = 'remove' AND lower(source) = lower(?) "
-                "AND target_lang = ?",
-                (source, target_lang),
+                "AND target_lang = ? AND set_id = ?",
+                (source, target_lang, set_id),
             )
         else:
             same = self.query_one(
                 "SELECT id FROM proposals WHERE status = 'pending' AND kind = 'term' AND lower(source) = lower(?) "
-                "AND target_lang = ? AND target = ?",
-                (source, target_lang, target),
+                "AND target_lang = ? AND target = ? AND set_id = ?",
+                (source, target_lang, target, set_id),
             )
         if same:
             return same["id"]
         cur = self.execute(
-            "INSERT INTO proposals (ts, source, target, target_lang, note, name, client, kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), source, target, target_lang, note, name, client, kind),
+            "INSERT INTO proposals (ts, source, target, target_lang, note, name, client, kind, set_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), source, target, target_lang, note, name, client, kind, set_id),
         )
         return int(cur.lastrowid or 0)
 
     def pending_proposals(self) -> list[dict]:
-        return self.query("SELECT id, ts, kind, source, target, target_lang, note, name FROM proposals "
+        return self.query("SELECT id, ts, kind, source, target, target_lang, note, name, set_id FROM proposals "
                           "WHERE status = 'pending' ORDER BY id")
 
     def count_pending_proposals(self) -> int:

@@ -12,7 +12,7 @@ I18N = json.loads((STATIC / "i18n.json").read_text(encoding="utf-8"))
 LANGS = ["en", "zh-CN", "zh-TW", "ja", "ko", "vi"]
 NAMESPACES = ("lang", "auth", "setup", "login", "nav", "overview", "chart", "terms", "connect", "invite", "toast",
               "recent", "source", "glossary", "example", "suggest", "try", "highlight", "settings", "err",
-              "warn", "history", "proposal", "member")
+              "warn", "history", "proposal", "member", "sets", "links")
 
 
 def test_every_language_has_every_key():
@@ -63,7 +63,7 @@ def test_non_english_text_has_no_stray_english_words():
     # Brand and technical names are allowed; ordinary English words would mean an untranslated string.
     allowed = {"glossa", "openai", "api", "key", "apikey", "csv", "token", "unsw", "zenith", "admin_password",
                "comp2521", "immersive", "translate", "beta", "aa", "usd", "gl", "oss", "a", "b", "strong",
-               "span", "class", "muted", "from", "memory", "myunsw", "ai"}
+               "span", "class", "muted", "from", "memory", "myunsw", "ai", "href", "sets"}
     word = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
     for lang in ("zh-CN", "zh-TW", "ja", "ko"):
         for key, text in I18N[lang].items():

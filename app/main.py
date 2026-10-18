@@ -29,7 +29,7 @@ from .auth import (
     require_team_key,
     setup_required,
 )
-from .db import Database, HistoryConflict, get_db
+from .db import DEFAULT_LINK, GENERAL_SET, Database, HistoryConflict, get_db
 from .engine import (
     PRESETS,
     call_once,
@@ -157,12 +157,23 @@ def create_app() -> FastAPI:
         return body
 
     # ------------------------------------------------------------------ translation endpoints
+    def link_sets(db: Database, slug: str | None) -> list[int]:
+        """Glossary sets for a request: the default link at /v1/..., or an admin-made link at /g/<slug>/v1/..."""
+        if not slug:
+            return db.link_set_ids(DEFAULT_LINK)
+        link = db.link_by_slug(slug)
+        if not link:
+            raise AppError(404, "link_not_found", "This Glossa link no longer exists. Ask your admin for the current one.")
+        return db.link_set_ids(link["id"])
+
     @app.post("/imme")
     @app.post("/translate")
-    async def immersive_custom_api(request: Request, db: Database = Depends(db_dep)):
+    @app.post("/g/{slug}/imme")
+    async def immersive_custom_api(request: Request, slug: str = "", db: Database = Depends(db_dep)):
         """Immersive Translate 'custom API' format:
         {source_lang, target_lang, text_list} -> {translations: [{detected_source_lang, text}]}"""
         require_team_key(request, db)
+        set_ids = link_sets(db, slug)
         body = await read_json(request)
         text_list = body.get("text_list")
         if isinstance(text_list, str):
@@ -171,7 +182,7 @@ def create_app() -> FastAPI:
             raise AppError(400, "bad_request", "'text_list' must be an array of strings.")
         if len(text_list) > 500:
             raise AppError(413, "too_many_paragraphs", "Too many paragraphs in one request (max 500).")
-        outcome = await translate_texts(db, text_list, body.get("target_lang"), "immersive")
+        outcome = await translate_texts(db, text_list, body.get("target_lang"), "immersive", set_ids)
         if outcome.first_error:
             raise outcome.first_error  # finished paragraphs are already in memory for the retry
         src = body.get("source_lang")
@@ -183,16 +194,20 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/v1/models")
-    async def list_models(request: Request, db: Database = Depends(db_dep)):
+    @app.get("/g/{slug}/v1/models")
+    async def list_models(request: Request, slug: str = "", db: Database = Depends(db_dep)):
         require_team_key(request, db)
+        link_sets(db, slug)
         model = load_settings(db).model
         return {"object": "list", "data": [{"id": model, "object": "model", "owned_by": "glossa"}]}
 
     @app.post("/v1/chat/completions")
-    async def openai_proxy(request: Request, db: Database = Depends(db_dep)):
+    @app.post("/g/{slug}/v1/chat/completions")
+    async def openai_proxy(request: Request, slug: str = "", db: Database = Depends(db_dep)):
         require_team_key(request, db)
+        set_ids = link_sets(db, slug)
         body = await read_json(request)
-        result = await proxy_chat(db, body)
+        result = await proxy_chat(db, body, set_ids)
         cid = "chatcmpl-glossa-" + uuid.uuid4().hex[:20]
         created = int(time.time())
         headers = {"X-Glossa-Cache": result.cache}
@@ -360,6 +375,20 @@ def create_app() -> FastAPI:
         return {"ok": True, "reply": reply[:200], "ms": int((time.perf_counter() - started) * 1000), "model": s.model}
 
     # ------------------------------------------------------------------ glossary
+    def truthy(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+        return bool(value)
+
+    def valid_set(db: Database, value) -> int:
+        try:
+            set_id = int(value or GENERAL_SET)
+        except (TypeError, ValueError):
+            raise AppError(400, "set_not_found", "That glossary set does not exist.")
+        if not db.get_set(set_id):
+            raise AppError(404, "set_not_found", "That glossary set does not exist.")
+        return set_id
+
     def clean_term(payload: dict, db: Database) -> dict:
         source = str(payload.get("source", "")).strip()
         target = str(payload.get("target", "")).strip()
@@ -372,6 +401,7 @@ def create_app() -> FastAPI:
         conditional = truthy(payload.get("conditional", False))
         if conditional and not note:
             raise AppError(400, "condition_needs_note", "Say in the note when this translation applies.")
+        enabled = payload.get("enabled")
         return {
             "source": source,
             "target": target,
@@ -379,12 +409,9 @@ def create_app() -> FastAPI:
             "note": note,
             "case_sensitive": truthy(payload.get("case_sensitive", False)),
             "conditional": conditional,
+            "set_id": valid_set(db, payload.get("set_id")),
+            "enabled": True if enabled is None or enabled == "" else truthy(enabled),
         }
-
-    def truthy(value) -> bool:
-        if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes")
-        return bool(value)
 
     def check_warnings(t: dict, payload: dict, db: Database) -> None:
         """Very short, everyday or very broad terms are saved only after the admin confirms."""
@@ -395,8 +422,8 @@ def create_app() -> FastAPI:
             raise AppError(409, "term_warning", f"Check “{t['source']}” before saving it.", term=t["source"], **report)
 
     @app.get("/api/glossary", dependencies=[Depends(admin_dep)])
-    async def list_glossary(q: str = "", db: Database = Depends(db_dep)):
-        terms = db.list_glossary(q.strip())
+    async def list_glossary(q: str = "", set_id: int = 0, db: Database = Depends(db_dep)):
+        terms = db.list_glossary(q.strip(), set_id or None)
         for row in terms:
             row["warn"] = static_warnings(row["source"], bool(row["case_sensitive"]))
         return {"terms": terms}
@@ -404,7 +431,7 @@ def create_app() -> FastAPI:
     @app.post("/api/glossary", dependencies=[Depends(admin_dep)])
     async def add_term(payload: dict = Body(...), db: Database = Depends(db_dep)):
         t = clean_term(payload, db)
-        existing = db.find_term(t["source"], t["target_lang"])
+        existing = db.find_term(t["source"], t["target_lang"], t["set_id"])
         if not existing or bool(existing["case_sensitive"]) != t["case_sensitive"]:
             check_warnings(t, payload, db)
         return db.upsert_term(**t)
@@ -416,7 +443,7 @@ def create_app() -> FastAPI:
         batch = new_batch("bulk")
         for item in payload.get("terms", [])[:1000]:
             try:
-                db.upsert_term(**clean_term(item, db), batch=batch)
+                db.upsert_term(**clean_term({"set_id": payload.get("set_id"), **item}, db), batch=batch)
                 added += 1
             except AppError:
                 continue
@@ -424,13 +451,13 @@ def create_app() -> FastAPI:
 
     @app.put("/api/glossary/{term_id}", dependencies=[Depends(admin_dep)])
     async def edit_term(term_id: int, payload: dict = Body(...), db: Database = Depends(db_dep)):
-        t = clean_term(payload, db)
         current = db.get_term(term_id)
         if not current:
             raise AppError(404, "term_not_found", "Term not found.")
+        t = clean_term({"enabled": current["enabled"], **payload}, db)
         clash = db.query_one(
-            "SELECT id FROM glossary WHERE source = ? AND target_lang = ? AND id != ?",
-            (t["source"], t["target_lang"], term_id),
+            "SELECT id FROM glossary WHERE set_id = ? AND source = ? AND target_lang = ? AND id != ?",
+            (t["set_id"], t["source"], t["target_lang"], term_id),
         )
         if clash:
             raise AppError(409, "term_exists", "That term already exists for this language.")
@@ -443,6 +470,14 @@ def create_app() -> FastAPI:
             raise AppError(404, "term_not_found", "Term not found.")
         return row
 
+    @app.post("/api/glossary/{term_id}/enabled", dependencies=[Depends(admin_dep)])
+    async def enable_term(term_id: int, payload: dict = Body(...), db: Database = Depends(db_dep)):
+        """Turn a term off for a while without losing it. Recorded in the history like any change."""
+        row = db.update_term(term_id, enabled=truthy(payload.get("enabled")))
+        if not row:
+            raise AppError(404, "term_not_found", "Term not found.")
+        return row
+
     @app.delete("/api/glossary/{term_id}", dependencies=[Depends(admin_dep)])
     async def remove_term(term_id: int, db: Database = Depends(db_dep)):
         if not db.delete_term(term_id):
@@ -451,11 +486,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/glossary/export", dependencies=[Depends(admin_dep)])
     async def export_glossary(db: Database = Depends(db_dep)):
+        names = {r["id"]: r["name"] for r in db.list_sets()}
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["source", "target", "target_lang", "note", "case_sensitive", "conditional"])
+        w.writerow(["source", "target", "target_lang", "note", "case_sensitive", "conditional", "set", "enabled"])
         for r in db.list_glossary():
-            w.writerow([r["source"], r["target"], r["target_lang"], r["note"], r["case_sensitive"], r["conditional"]])
+            w.writerow([r["source"], r["target"], r["target_lang"], r["note"], r["case_sensitive"], r["conditional"],
+                        names.get(r["set_id"], ""), r["enabled"]])
         return Response(
             "﻿" + buf.getvalue(),
             media_type="text/csv; charset=utf-8",
@@ -472,11 +509,17 @@ def create_app() -> FastAPI:
             header = [c.strip().lower() for c in rows[0]]
             rows = rows[1:]
         else:
-            header = ["source", "target", "target_lang", "note", "case_sensitive", "conditional"]
+            header = ["source", "target", "target_lang", "note", "case_sensitive", "conditional", "set", "enabled"]
         added, skipped = 0, 0
         batch = new_batch("import")  # the whole file is one history group, so one undo
+        set_ids: dict[str, int] = {}
         for row in rows[:5000]:
             item = {header[i]: row[i] for i in range(min(len(header), len(row)))}
+            name = str(item.pop("set", "") or "").strip()
+            if name not in set_ids:  # a set named in the file is created if it does not exist yet
+                found = db.find_set_by_name(name) if name else db.get_set(GENERAL_SET)
+                set_ids[name] = (found or db.add_set(name[:60]))["id"]
+            item["set_id"] = set_ids[name]
             try:
                 db.upsert_term(**clean_term(item, db), batch=batch)
                 added += 1
@@ -502,59 +545,175 @@ def create_app() -> FastAPI:
                            f"“{exc.term}” has changed since. Undo the newer change first.", term=exc.term)
         return {"undone": count}
 
+    # ------------------------------------------------------------------ glossary sets and links
+    def clean_name(payload: dict) -> str:
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            raise AppError(400, "name_required", "Give it a name.")
+        if len(name) > 60:
+            raise AppError(400, "name_too_long", "Keep the name under 60 characters.", max=60)
+        return name
+
+    def link_info(request: Request, db: Database, link: dict) -> dict:
+        base = public_base(request)
+        key = db.get_setting("team_key", "") or ""
+        prefix = f"{base}/g/{link['slug']}" if link["slug"] else base
+        return {
+            **link,
+            "default": link["id"] == DEFAULT_LINK,
+            "openai": f"{prefix}/v1/chat/completions",
+            "custom": f"{prefix}/imme?token={key}",
+            "suggest_url": f"{base}/suggest#key={key}" + (f"&link={link['slug']}" if link["slug"] else ""),
+        }
+
+    def clean_set_ids(db: Database, value) -> list[int]:
+        if not isinstance(value, list) or not value:
+            raise AppError(400, "link_needs_set", "Choose at least one glossary set for this link.")
+        return [valid_set(db, v) for v in value]
+
+    def get_link_or_404(db: Database, link_id: int) -> dict:
+        link = db.get_link(link_id)
+        if not link:
+            raise AppError(404, "link_not_found", "That link no longer exists.")
+        return link
+
+    @app.get("/api/sets", dependencies=[Depends(admin_dep)])
+    async def list_sets_and_links(request: Request, db: Database = Depends(db_dep)):
+        return {"sets": db.list_sets(), "links": [link_info(request, db, l) for l in db.list_links()]}
+
+    @app.post("/api/sets", dependencies=[Depends(admin_dep)])
+    async def create_set(payload: dict = Body(...), db: Database = Depends(db_dep)):
+        name = clean_name(payload)
+        if db.find_set_by_name(name):
+            raise AppError(409, "set_exists", "There is already a set with that name.")
+        return db.add_set(name)
+
+    @app.put("/api/sets/{set_id}", dependencies=[Depends(admin_dep)])
+    async def rename_set(set_id: int, payload: dict = Body(...), db: Database = Depends(db_dep)):
+        valid_set(db, set_id)
+        name = clean_name(payload)
+        same = db.find_set_by_name(name)
+        if same and same["id"] != set_id:
+            raise AppError(409, "set_exists", "There is already a set with that name.")
+        db.rename_set(set_id, name)
+        return db.get_set(set_id)
+
+    @app.post("/api/sets/{set_id}/move", dependencies=[Depends(admin_dep)])
+    async def move_set(set_id: int, payload: dict = Body(...), db: Database = Depends(db_dep)):
+        valid_set(db, set_id)
+        db.move_set(set_id, -1 if int(payload.get("direction", 1)) < 0 else 1)
+        return {"sets": db.list_sets()}
+
+    @app.delete("/api/sets/{set_id}", dependencies=[Depends(admin_dep)])
+    async def delete_set(set_id: int, db: Database = Depends(db_dep)):
+        valid_set(db, set_id)
+        if set_id == GENERAL_SET:
+            raise AppError(400, "set_protected", "The General set cannot be deleted.")
+        n = (db.query_one("SELECT COUNT(*) AS n FROM glossary WHERE set_id = ?", (set_id,)) or {}).get("n", 0)
+        if n:
+            raise AppError(409, "set_not_empty", "Move or delete the terms in this set first.", n=n)
+        db.delete_set(set_id)
+        return {"ok": True}
+
+    @app.post("/api/links", dependencies=[Depends(admin_dep)])
+    async def create_link(request: Request, payload: dict = Body(...), db: Database = Depends(db_dep)):
+        link = db.add_link(clean_name(payload), clean_set_ids(db, payload.get("set_ids")))
+        return link_info(request, db, {**link, "set_ids": db.link_set_ids(link["id"])})
+
+    @app.put("/api/links/{link_id}", dependencies=[Depends(admin_dep)])
+    async def update_link(link_id: int, request: Request, payload: dict = Body(...), db: Database = Depends(db_dep)):
+        get_link_or_404(db, link_id)
+        name = None if link_id == DEFAULT_LINK or "name" not in payload else clean_name(payload)
+        set_ids = clean_set_ids(db, payload["set_ids"]) if "set_ids" in payload else None
+        db.update_link(link_id, name, set_ids)
+        link = db.get_link(link_id)
+        return link_info(request, db, {**link, "set_ids": db.link_set_ids(link_id)})  # type: ignore[dict-item]
+
+    @app.delete("/api/links/{link_id}", dependencies=[Depends(admin_dep)])
+    async def delete_link(link_id: int, db: Database = Depends(db_dep)):
+        get_link_or_404(db, link_id)
+        if link_id == DEFAULT_LINK:
+            raise AppError(400, "link_protected", "The default link cannot be deleted.")
+        db.delete_link(link_id)
+        return {"ok": True}
+
     # ------------------------------------------------------------------ proposals from teammates
     def team_term(row: dict) -> dict:
-        return {k: row[k] for k in ("source", "target", "target_lang", "note", "case_sensitive", "conditional")}
+        return {k: row[k] for k in ("source", "target", "target_lang", "note", "case_sensitive", "conditional",
+                                    "set_id")}
+
+    def team_link(db: Database, slug: str) -> tuple[dict, list[int]]:
+        link = db.link_by_slug(slug or "")
+        if not link:
+            raise AppError(404, "link_not_found", "This Glossa link no longer exists. Ask your admin for the current one.")
+        return link, db.link_set_ids(link["id"])
+
+    def existing_in(db: Database, source: str, target_lang: str, set_ids: list[int]) -> dict | None:
+        """The term a link would use for this source text (case-insensitive), by set priority."""
+        rows = [r for r in db.query("SELECT * FROM glossary WHERE lower(source) = lower(?) AND target_lang = ?",
+                                    (source, target_lang)) if r["set_id"] in set_ids]
+        rows.sort(key=lambda r: set_ids.index(r["set_id"]))
+        return rows[0] if rows else None
+
+    def effective_terms(db: Database, set_ids: list[int]) -> list[dict]:
+        """What a link's translations actually use: enabled terms, one per word, from the highest-priority set."""
+        seen, out = set(), []
+        rows = [r for r in db.list_glossary() if r["set_id"] in set_ids and r["enabled"]]
+        for r in sorted(rows, key=lambda r: set_ids.index(r["set_id"])):
+            key = (r["source"].lower(), r["target_lang"])
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+        return sorted(out, key=lambda r: r["source"].lower())
 
     @app.get("/api/team/glossary")
-    async def team_glossary(request: Request, db: Database = Depends(db_dep)):
+    async def team_glossary(request: Request, link: str = "", db: Database = Depends(db_dep)):
         require_team_key(request, db)
+        found, set_ids = team_link(db, link)
         s = load_settings(db)
         return {
             "team_name": db.get_setting("team_name", "") or "",
+            "link_name": found["name"],
             "default_target_lang": s.default_target_lang,
             "languages": LANG_NAMES,
-            "terms": [team_term(r) for r in db.list_glossary()[:5000]],
+            "terms": [team_term(r) for r in effective_terms(db, set_ids)[:5000]],
         }
 
     @app.post("/api/team/proposals")
     async def propose_term(request: Request, db: Database = Depends(db_dep)):
         require_team_key(request, db)
         payload = await read_json(request)
+        _, set_ids = team_link(db, str(payload.get("link", "")))
         cid = client_id(request)
         if PROPOSAL_LIMITER.blocked(cid):
             raise AppError(429, "too_many_proposals", "Too many suggestions from this device. Try again later.")
         kind = "remove" if payload.get("kind") == "remove" else "term"
+        lang = canon(payload.get("target_lang") or load_settings(db).default_target_lang)
+        current = existing_in(db, str(payload.get("source", "")).strip(), lang, set_ids)
         if kind == "remove":
             # Only an existing term can be suggested for removal; no translation is needed.
-            lang = canon(payload.get("target_lang") or load_settings(db).default_target_lang)
-            current = existing_for(db, str(payload.get("source", "")).strip(), lang)
             if not current:
                 raise AppError(404, "term_not_found", "Term not found.")
             t = {"source": current["source"], "target": current["target"], "target_lang": lang,
                  "note": str(payload.get("note", "")).strip()[:300]}
         else:
-            t = clean_term({**payload, "conditional": False, "case_sensitive": False}, db)
+            t = clean_term({**payload, "conditional": False, "case_sensitive": False, "set_id": None}, db)
+        # A change goes into the set the term is in; a new term into the link's first set.
+        set_id = current["set_id"] if current else set_ids[0]
         name = str(payload.get("name", "")).strip()
         if len(name) > 40:
             raise AppError(400, "name_too_long", "Keep your name under 40 characters.", max=40)
         if db.count_pending_proposals() >= MAX_PENDING_PROPOSALS:
             raise AppError(429, "proposals_full", "Too many suggestions are waiting for review.")
         PROPOSAL_LIMITER.fail(cid)  # counts towards the hourly limit
-        pid = db.add_proposal(t["source"], t["target"], t["target_lang"], t["note"], name, cid, kind)
+        pid = db.add_proposal(t["source"], t["target"], t["target_lang"], t["note"], name, cid, kind, set_id)
         return {"ok": True, "id": pid}
-
-    def existing_for(db: Database, source: str, target_lang: str) -> dict | None:
-        return db.query_one(
-            "SELECT * FROM glossary WHERE lower(source) = lower(?) AND target_lang = ? ORDER BY id LIMIT 1",
-            (source, target_lang),
-        )
 
     @app.get("/api/proposals", dependencies=[Depends(admin_dep)])
     async def list_proposals(db: Database = Depends(db_dep)):
         out = []
         for p in db.pending_proposals():
-            current = existing_for(db, p["source"], p["target_lang"])
+            current = existing_in(db, p["source"], p["target_lang"], [p["set_id"]])
             out.append({
                 **p,
                 "current": team_term(current) if current else None,
@@ -573,7 +732,8 @@ def create_app() -> FastAPI:
     @app.post("/api/proposals/{proposal_id}/approve", dependencies=[Depends(admin_dep)])
     async def approve_proposal(proposal_id: int, payload: dict = Body(default={}), db: Database = Depends(db_dep)):
         p = pending(db, proposal_id)
-        current = existing_for(db, p["source"], p["target_lang"])
+        set_id = p["set_id"] if db.get_set(p["set_id"]) else GENERAL_SET
+        current = existing_in(db, p["source"], p["target_lang"], [set_id])
         if p["kind"] == "remove":
             # Recorded in the history like any deletion, so it can be undone.
             if current:
@@ -589,6 +749,7 @@ def create_app() -> FastAPI:
             "note": payload["note"] if "note" in payload else (current["note"] if current else p["note"]),
             "case_sensitive": bool(current and current["case_sensitive"]),
             "conditional": payload.get("conditional", bool(current and current["conditional"])),
+            "set_id": set_id,
         }, db)
         if not current:
             check_warnings(t, payload, db)
@@ -612,15 +773,19 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ try it / cache / stats
     @app.post("/api/translate", dependencies=[Depends(admin_dep)])
     async def try_translate(payload: dict = Body(...), db: Database = Depends(db_dep)):
-        return await try_it(db, payload, "dashboard", 20000)
+        """Try it in the dashboard, as seen through any link (the default link unless link_id is given)."""
+        link = get_link_or_404(db, int(payload.get("link_id") or DEFAULT_LINK))
+        return await try_it(db, payload, "dashboard", 20000, db.link_set_ids(link["id"]))
 
     @app.post("/api/team/translate")
     async def team_try_translate(request: Request, db: Database = Depends(db_dep)):
         """Try it on the teammate page. Same glossary, memory and rate limit as the extension."""
         require_team_key(request, db)
-        return await try_it(db, await read_json(request), "member", 5000)
+        payload = await read_json(request)
+        _, set_ids = team_link(db, str(payload.get("link", "")))
+        return await try_it(db, payload, "member", 5000, set_ids)
 
-    async def try_it(db: Database, payload: dict, endpoint: str, max_chars: int) -> dict:
+    async def try_it(db: Database, payload: dict, endpoint: str, max_chars: int, set_ids: list[int]) -> dict:
         text = str(payload.get("text", ""))
         if not text.strip():
             raise AppError(400, "text_required", "Type or paste something to translate.")
@@ -628,7 +793,7 @@ def create_app() -> FastAPI:
             raise AppError(413, "text_too_long", f"Keep the sample under {max_chars} characters.", max=max_chars)
         paragraphs = text.split("\n")
         started = time.perf_counter()
-        outcome = await translate_texts(db, paragraphs, payload.get("target_lang"), endpoint)
+        outcome = await translate_texts(db, paragraphs, payload.get("target_lang"), endpoint, set_ids)
         err = outcome.first_error
         if err and all(i.error or i.skipped for i in outcome.items):
             raise err  # nothing came back at all

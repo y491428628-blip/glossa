@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <title>Glossa</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='9' width='28' height='15' rx='3' fill='%23f5e15a'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='16' text-anchor='middle' fill='%231b2440'%3EGl%3C/text%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/app.css?v=0.3.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.4.0">
 </head>
 <body>
 
@@ -50,6 +50,7 @@
       <nav class="nav" data-i18n-aria="nav.aria">
         <a href="#overview" data-view="overview" data-i18n="nav.overview"></a>
         <a href="#glossary" data-view="glossary"><span data-i18n="nav.glossary"></span><span class="nav-badge" id="nav-badge" hidden></span></a>
+        <a href="#sets" data-view="sets" data-i18n="nav.sets"></a>
         <a href="#try" data-view="try" data-i18n="nav.try"></a>
         <a href="#settings" data-view="settings" data-i18n="nav.settings"></a>
       </nav>
@@ -116,6 +117,7 @@
             <h3 data-i18n="connect.member_title"></h3>
             <p class="small muted" data-i18n="connect.member_body"></p>
             <div class="copy-field"><code id="suggest-url"></code><button class="btn" type="button" data-copy="suggest-url" data-i18n="connect.copy"></button></div>
+            <p class="small muted" style="margin-top:12px" data-i18n-html="connect.links_hint_html"></p>
           </div>
           <details class="more" style="margin-top:20px">
             <summary data-i18n="connect.custom_summary"></summary>
@@ -159,6 +161,7 @@
         <label class="field"><span class="field-label" data-i18n-html="glossary.note_html"></span><input type="text" name="note" maxlength="300" data-i18n-ph="glossary.note_ph"></label>
         <button class="btn btn-primary add-btn" type="submit" data-i18n="glossary.add"></button>
         <div class="add-term-options">
+          <label class="check small set-pick"><span data-i18n="sets.label"></span> <select name="set_id" class="set-select"></select></label>
           <label class="check small"><input type="checkbox" name="case_sensitive"> <span data-i18n="glossary.case_label"></span></label>
           <label class="check small"><input type="checkbox" name="conditional"> <span data-i18n="glossary.cond_label"></span></label>
           <span class="small muted" data-i18n="glossary.cond_help"></span>
@@ -167,7 +170,10 @@
 
       <div class="section-head" style="margin-top:28px">
         <h2 id="glossary-count"></h2>
-        <input type="search" id="glossary-search" data-i18n-ph="glossary.search_ph" data-i18n-aria="glossary.search_ph" style="max-width:280px">
+        <div class="row glossary-tools">
+          <select id="glossary-set-filter" data-i18n-aria="sets.filter"></select>
+          <input type="search" id="glossary-search" data-i18n-ph="glossary.search_ph" data-i18n-aria="glossary.search_ph">
+        </div>
       </div>
       <div class="panel table-wrap" id="glossary-list"></div>
 
@@ -199,6 +205,34 @@
       </div>
     </section>
 
+    <!-- ---------- glossary sets and links ---------- -->
+    <section id="view-sets" data-view-panel="sets" hidden>
+      <h1 data-i18n="sets.title"></h1>
+      <p class="lede" data-i18n="sets.lede"></p>
+
+      <div class="section">
+        <div class="section-head"><h2 data-i18n="sets.sets_h"></h2></div>
+        <div class="panel">
+          <ul class="set-list" id="set-list"></ul>
+          <form class="row" id="add-set" style="margin-top:16px">
+            <input type="text" name="name" maxlength="60" required data-i18n-ph="sets.new_ph" style="max-width:320px">
+            <button class="btn btn-primary" type="submit" data-i18n="sets.add"></button>
+          </form>
+          <p class="small muted" style="margin-top:12px" data-i18n="sets.priority_help"></p>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head"><h2 data-i18n="links.title"></h2></div>
+        <p class="lede" style="margin:-6px 0 16px" data-i18n="links.lede"></p>
+        <div id="link-list" class="link-list"></div>
+        <form class="panel row" id="add-link" style="margin-top:16px">
+          <input type="text" name="name" maxlength="60" required data-i18n-ph="links.new_ph" style="max-width:320px">
+          <button class="btn btn-primary" type="submit" data-i18n="links.add"></button>
+        </form>
+      </div>
+    </section>
+
     <!-- ---------- try it ---------- -->
     <section id="view-try" data-view-panel="try" hidden>
       <h1 data-i18n="try.title"></h1>
@@ -209,6 +243,7 @@
             <textarea name="text" id="try-text" data-i18n-ph="try.text_ph"></textarea></label>
           <div class="row">
             <label class="field" style="flex:1; min-width:160px"><span class="sr-only" data-i18n="try.into"></span><select name="target_lang" class="lang-select" data-i18n-aria="try.into"></select></label>
+            <label class="field" style="flex:1; min-width:160px"><span class="sr-only" data-i18n="try.link"></span><select name="link_id" id="try-link" data-i18n-aria="try.link"></select></label>
             <button class="btn" type="button" id="try-sample" data-i18n="try.sample"></button>
             <button class="btn btn-primary" type="submit" data-i18n="try.submit"></button>
           </div>
@@ -296,7 +331,7 @@
 </dialog>
 
 <div id="toast" class="toast" role="status" hidden></div>
-<script src="/static/i18n.js?v=0.3.1"></script>
-<script src="/static/app.js?v=0.3.1"></script>
+<script src="/static/i18n.js?v=0.4.0"></script>
+<script src="/static/app.js?v=0.4.0"></script>
 </body>
 </html>

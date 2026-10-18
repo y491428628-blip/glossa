@@ -155,6 +155,31 @@ class Term:
     whole: re.Pattern        # matches a paragraph that is only the term
     note: str = ""           # sent to the AI with the term
     conditional: bool = False  # the AI decides from the note whether the term applies; never forced
+    set_id: int = 1
+    rank: tuple = ()         # set priority: lower wins when a link's sets share a term
+
+
+class TermView:
+    """The terms one link uses for one target language: enabled terms in the link's sets, where a
+    term that appears in several sets comes from the highest-priority set."""
+
+    def __init__(self, terms: list[Term]):
+        self.terms = terms
+
+    def match(self, text: str) -> list[Term]:
+        return [t for t in self.terms if t.pattern.search(text)]
+
+    def exact(self, text: str) -> Term | None:
+        """The term, if the whole paragraph is just that term (menu items, labels, headings)."""
+        stripped = text.strip().rstrip(_TRAILING_PUNCT).strip()
+        if not stripped or len(stripped) > 200:
+            return None
+        for t in self.terms:
+            if t.conditional:
+                continue  # whether it applies depends on the meaning, so the AI decides
+            if t.whole.fullmatch(stripped):
+                return t
+        return None
 
 
 class GlossaryMatcher:
@@ -163,13 +188,18 @@ class GlossaryMatcher:
     def __init__(self) -> None:
         self._version = -1
         self._terms: list[Term] = []
+        self._views: dict[tuple, TermView] = {}
 
     def _compile(self, db: Database) -> None:
         version = db.glossary_version()
         if version == self._version:
             return
         terms: list[Term] = []
-        for row in db.query("SELECT * FROM glossary"):
+        rows = db.query(
+            "SELECT g.*, s.position AS set_position FROM glossary g "
+            "JOIN glossary_sets s ON s.id = g.set_id WHERE g.enabled = 1"
+        )
+        for row in rows:
             src = row["source"].strip()
             if not src:
                 continue
@@ -185,31 +215,30 @@ class GlossaryMatcher:
                     whole=whole,
                     note=(row.get("note") or "").strip(),
                     conditional=bool(row.get("conditional")),
+                    set_id=row["set_id"],
+                    rank=(row["set_id"] == 1, row["set_position"], row["set_id"]),
                 )
             )
-        terms.sort(key=lambda t: -len(t.source))  # longer terms first: "census date" before "date"
         self._terms = terms
+        self._views = {}
         self._version = version
 
-    def _for_lang(self, lang: str) -> list[Term]:
-        return [t for t in self._terms if t.target_lang == lang or t.target_lang == "*"]
-
-    def match(self, db: Database, text: str, target_lang: str) -> list[Term]:
+    def view(self, db: Database, target_lang: str, set_ids: list[int]) -> TermView:
         self._compile(db)
-        return [t for t in self._for_lang(canon(target_lang)) if t.pattern.search(text)]
-
-    def exact(self, db: Database, text: str, target_lang: str) -> Term | None:
-        """The term, if the whole paragraph is just that term (menu items, labels, headings)."""
-        self._compile(db)
-        stripped = text.strip().rstrip(_TRAILING_PUNCT).strip()
-        if not stripped or len(stripped) > 200:
-            return None
-        for t in self._for_lang(canon(target_lang)):
-            if t.conditional:
-                continue  # whether it applies depends on the meaning, so the AI decides
-            if t.whole.fullmatch(stripped):
-                return t
-        return None
+        lang = canon(target_lang)
+        key = (lang, tuple(set_ids))
+        if key not in self._views:
+            allowed = set(set_ids)
+            best: dict[str, Term] = {}
+            for t in self._terms:
+                if t.set_id not in allowed or (t.target_lang != lang and t.target_lang != "*"):
+                    continue
+                k = t.source.lower()
+                if k not in best or t.rank < best[k].rank:
+                    best[k] = t
+            # Longer terms first: "census date" before "date".
+            self._views[key] = TermView(sorted(best.values(), key=lambda t: -len(t.source)))
+        return self._views[key]
 
 
 MATCHER = GlossaryMatcher()
@@ -707,15 +736,22 @@ class BatchOutcome:
         return next((i.error for i in self.items if i.error), None)
 
 
-async def translate_texts(db: Database, texts: list[str], target_lang: str | None, endpoint: str) -> BatchOutcome:
+def default_sets(db: Database) -> list[int]:
+    return db.link_set_ids(1)
+
+
+async def translate_texts(db: Database, texts: list[str], target_lang: str | None, endpoint: str,
+                          set_ids: list[int] | None = None) -> BatchOutcome:
     """Translates every paragraph it can. Failed paragraphs carry `error`; successful ones are
-    saved to memory, so a retry only has to redo the failures."""
+    saved to memory, so a retry only has to redo the failures. `set_ids` are the glossary sets of
+    the link the request came through (the default link if None)."""
     started = time.perf_counter()
     settings = load_settings(db)
     target = canon(target_lang, settings.default_target_lang)
     if target in ("auto", "*"):
         target = settings.default_target_lang
     style_hash = sha(settings.style_guide)[:12]
+    view = MATCHER.view(db, target, default_sets(db) if set_ids is None else set_ids)
 
     results = [ItemResult(source=t, text=t) for t in texts]
     item_terms: list[list[Term]] = [[] for _ in texts]
@@ -725,7 +761,7 @@ async def translate_texts(db: Database, texts: list[str], target_lang: str | Non
         if not text or not text.strip() or not _HAS_LETTER.search(text):
             results[i].skipped = True
             continue
-        direct = MATCHER.exact(db, text, target)
+        direct = view.exact(text)
         if direct is not None:
             stripped = text.strip()
             suffix = stripped[len(stripped.rstrip(_TRAILING_PUNCT)):]  # keep a trailing colon etc.
@@ -733,7 +769,7 @@ async def translate_texts(db: Database, texts: list[str], target_lang: str | Non
             results[i].direct = True
             item_terms[i] = [direct]
             continue
-        terms = MATCHER.match(db, text, target)
+        terms = view.match(text)
         item_terms[i] = terms
         keys[i] = sha("p", PROMPT_VERSION, settings.model, target, style_hash, signature(terms), text)
 
@@ -847,7 +883,7 @@ class ProxyResult:
     cache: str  # "hit", "partial" or "miss"
 
 
-async def proxy_chat(db: Database, body: dict) -> ProxyResult:
+async def proxy_chat(db: Database, body: dict, set_ids: list[int] | None = None) -> ProxyResult:
     settings = load_settings(db)
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -859,7 +895,7 @@ async def proxy_chat(db: Database, body: dict) -> ProxyResult:
 
     paragraphs = parse_paragraph_prompt(user_msgs[-1]) if user_msgs else None
     if paragraphs:
-        outcome = await translate_texts(db, [t for _, t in paragraphs], target, "openai")
+        outcome = await translate_texts(db, [t for _, t in paragraphs], target, "openai", set_ids)
         if outcome.first_error:
             raise outcome.first_error
         lines = []
@@ -869,16 +905,16 @@ async def proxy_chat(db: Database, body: dict) -> ProxyResult:
         from_memory = sum(1 for i in served if i.cached or i.direct)
         cache = "hit" if served and from_memory == len(served) else ("partial" if from_memory else "miss")
         return ProxyResult("\n".join(lines) + "\n[[source_end]]", settings.model, cache)
-    return await _proxy_whole(db, settings, messages, user_msgs, target)
+    return await _proxy_whole(db, settings, messages, user_msgs, target, set_ids)
 
 
 async def _proxy_whole(db: Database, settings: EngineSettings, messages: list[dict],
-                       user_msgs: list[str], target: str) -> ProxyResult:
+                       user_msgs: list[str], target: str, set_ids: list[int] | None) -> ProxyResult:
     """Fallback for prompts that are not in the paragraph format: forward the whole request,
     adding the glossary to the system prompt, and cache the complete answer."""
     started = time.perf_counter()
     user_text = "\n".join(user_msgs)
-    terms = MATCHER.match(db, user_text, target)
+    terms = MATCHER.view(db, target, default_sets(db) if set_ids is None else set_ids).match(user_text)
     extra = []
     if settings.style_guide.strip():
         extra.append("Team style guide:\n" + settings.style_guide.strip())

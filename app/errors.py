@@ -16,6 +16,9 @@ ALL_CODES = (
     # glossary safety (v0.3)
     "term_warning", "condition_needs_note", "history_not_found", "history_conflict", "already_undone",
     "proposal_not_found", "proposal_decided", "too_many_proposals", "proposals_full", "name_too_long",
+    # glossary sets and links (v0.4)
+    "set_not_found", "set_exists", "set_protected", "set_not_empty", "link_not_found", "link_protected",
+    "link_needs_set", "name_required",
 )
 
 

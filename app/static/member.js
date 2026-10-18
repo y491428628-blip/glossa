@@ -4,7 +4,9 @@
 
 const KEY_STORE = "glossa.team_key";
 const NAME_STORE = "glossa.name";
+const LINK_STORE = "glossa.link";
 let teamKey = "";
+let linkSlug = "";  // which of the admin's links this teammate was given; "" is the default link
 let data = null;  // {team_name, default_target_lang, languages, terms}
 let lastSent = null;  // {term, kind}, kept so the confirmation can be redrawn in another language
 let removing = null;  // the term being suggested for removal, or null for a normal suggestion
@@ -37,12 +39,14 @@ function remember(k, v) { try { localStorage.setItem(k, v); } catch { /* private
 function recall(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } }
 function forget(k) { try { localStorage.removeItem(k); } catch { /* private mode */ } }
 
-/** The setup link carries the key after #, which browsers never send to servers. Take it and tidy the address bar. */
-function keyFromLink() {
-  const m = location.hash.match(/key=([^&]+)/);
-  if (!m) return "";
+/** The setup link carries the key (and which link) after #, which browsers never send to servers.
+    Take them and tidy the address bar. */
+function fromLink() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const key = (params.get("key") || "").trim();
+  if (!key) return null;
   history.replaceState(null, "", location.pathname);
-  return decodeURIComponent(m[1]).trim();
+  return { key, link: (params.get("link") || "").trim() };
 }
 
 async function teamApi(path, opts = {}) {
@@ -74,12 +78,13 @@ function showGate(message = "") {
 }
 
 async function loadTeam() {
-  data = await teamApi("/api/team/glossary");
+  data = await teamApi("/api/team/glossary" + (linkSlug ? `?link=${encodeURIComponent(linkSlug)}` : ""));
   remember(KEY_STORE, teamKey);
+  remember(LINK_STORE, linkSlug);
   LANG_FALLBACK = data.languages;
   $("#key-gate").hidden = true;
   $("#member-app").hidden = false;
-  $("#team-name").textContent = data.team_name || "";
+  $("#team-name").textContent = [data.team_name, data.link_name].filter(Boolean).join(" · ");
   fillSelect();
   renderList();
 }
@@ -130,7 +135,7 @@ $("#member-try-form").addEventListener("submit", async (e) => {
   btn.disabled = true;
   btn.textContent = t("try.busy");
   try {
-    lastTry = { result: await teamApi("/api/team/translate", { method: "POST", body: { text: f.text.value, target_lang: f.target_lang.value } }) };
+    lastTry = { result: await teamApi("/api/team/translate", { method: "POST", body: { text: f.text.value, target_lang: f.target_lang.value, link: linkSlug } }) };
   } catch (err) {
     if (err.code === "wrong_team_key") { forget(KEY_STORE); showGate(err.message); }
     lastTry = { error: err };
@@ -215,8 +220,8 @@ $("#propose-form").addEventListener("submit", async (e) => {
   const err = $(".form-error", f);
   err.textContent = "";
   const body = removing
-    ? { kind: "remove", source: removing.source, target_lang: removing.target_lang, note: f.note.value, name: f.name.value }
-    : { source: f.source.value, target: f.target.value, target_lang: f.target_lang.value, note: f.note.value, name: f.name.value };
+    ? { kind: "remove", source: removing.source, target_lang: removing.target_lang, note: f.note.value, name: f.name.value, link: linkSlug }
+    : { source: f.source.value, target: f.target.value, target_lang: f.target_lang.value, note: f.note.value, name: f.name.value, link: linkSlug };
   try {
     await teamApi("/api/team/proposals", { method: "POST", body });
     remember(NAME_STORE, f.name.value.trim());
@@ -235,12 +240,15 @@ async function boot() {
   await loadI18n();
   setFormMode(null);
   $("#propose-form").name.value = recall(NAME_STORE);
-  teamKey = keyFromLink() || recall(KEY_STORE);
+  const given = fromLink();
+  teamKey = given ? given.key : recall(KEY_STORE);
+  linkSlug = given ? given.link : recall(LINK_STORE);
   if (!teamKey) return showGate();
   try {
     await loadTeam();
   } catch (err) {
     if (err.code === "wrong_team_key") forget(KEY_STORE);
+    if (err.code === "link_not_found") { forget(LINK_STORE); linkSlug = ""; }
     showGate(err.message);
   }
 }

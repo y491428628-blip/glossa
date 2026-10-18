@@ -3,7 +3,7 @@
 
 const state = {
   settings: null, presets: {}, overview: null, glossary: [], aiSuggestions: [],
-  proposals: [], history: [], historyAll: false, view: null,
+  proposals: [], history: [], historyAll: false, view: null, sets: [], links: [],
 };
 
 const SAMPLE_TEXT = [
@@ -149,7 +149,7 @@ $("#signout").addEventListener("click", async () => {
 });
 
 /* ---------------- router ---------------- */
-const VIEWS = { overview: loadOverview, glossary: loadGlossaryView, try: renderTry, settings: renderSettings };
+const VIEWS = { overview: loadOverview, glossary: loadGlossaryView, sets: loadSetsView, try: loadTryView, settings: renderSettings };
 function route(keepScroll = false) {
   if ($("#app").hidden) return;
   const view = (location.hash || "#overview").slice(1);
@@ -280,17 +280,52 @@ $("#copy-invite").addEventListener("click", () => {
   copyText(text, t("toast.invite_copied"));
 });
 
+/* ---------------- glossary sets (shared helpers) ---------------- */
+function setName(id) {
+  const set = state.sets.find((x) => x.id === id);
+  if (!set) return "?";
+  return set.name || t("sets.general");  // the built-in set has no stored name, so it follows the interface language
+}
+function setOptions(selected) {
+  return state.sets.map((x) => `<option value="${x.id}"${x.id === selected ? " selected" : ""}>${esc(setName(x.id))}</option>`).join("");
+}
+function multiSet() { return state.sets.length > 1; }
+
+async function loadSets() {
+  const { sets, links } = await api("/api/sets");
+  state.sets = sets;
+  state.links = links;
+  const filter = $("#glossary-set-filter");
+  const keep = Number(filter.value || 0);
+  filter.innerHTML = `<option value="0">${esc(t("sets.all"))}</option>` + state.sets.map((x) => `<option value="${x.id}"${x.id === keep ? " selected" : ""}>${esc(setName(x.id))}</option>`).join("");
+  filter.hidden = !multiSet();
+  $$(".set-select").forEach((sel) => { const v = Number(sel.value || keep || 1); sel.innerHTML = setOptions(state.sets.some((x) => x.id === v) ? v : 1); });
+  $(".set-pick").hidden = !multiSet();
+}
+
 /* ---------------- glossary ---------------- */
 async function loadGlossaryView() {
+  await loadSets();
   await Promise.all([loadGlossary(), refreshProposals(), loadHistory()]);
 }
 
 async function loadGlossary() {
   const q = $("#glossary-search").value.trim();
-  const { terms } = await api("/api/glossary" + (q ? `?q=${encodeURIComponent(q)}` : ""));
+  const setId = Number($("#glossary-set-filter").value || 0);
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (setId) params.set("set_id", setId);
+  const { terms } = await api("/api/glossary" + (params.toString() ? `?${params}` : ""));
   state.glossary = terms;
-  renderGlossary(q);
+  renderGlossary(Boolean(q || setId));
 }
+
+$("#glossary-set-filter").addEventListener("change", () => {
+  // New terms go into the set being looked at.
+  const v = Number($("#glossary-set-filter").value || 0);
+  if (v) $("#add-term select[name=set_id]").value = v;
+  loadGlossary();
+});
 
 /** After any glossary change: the list, and the history that now has a new entry. */
 function glossaryChanged() {
@@ -299,18 +334,21 @@ function glossaryChanged() {
 
 function termPills(x) {
   const pills = [];
+  if (!x.enabled) pills.push(`<span class="pill pill-off" title="${esc(t("glossary.off_title"))}">${esc(t("glossary.off_pill"))}</span>`);
   if (x.case_sensitive) pills.push(`<span class="pill" title="${esc(t("glossary.case_title"))}">Aa</span>`);
   if (x.conditional) pills.push(`<span class="pill pill-cond" title="${esc(t("glossary.cond_title"))}">${esc(t("glossary.cond_pill"))}</span>`);
   if (x.warn?.length) pills.push(`<span class="pill pill-warn" title="${esc(x.warn.map((w) => t("warn." + w)).join(" "))}">${esc(t("glossary.warn_pill"))}</span>`);
   return pills.length ? " " + pills.join(" ") : "";
 }
 
-function renderGlossary(q) {
+/** `filtered`: a search or a set filter is active, so an empty list means "nothing matches". */
+function renderGlossary(filtered) {
   const terms = state.glossary;
-  $("#glossary-count").textContent = q ? t("glossary.count_matching", { n: fmt(terms.length) }) : tn("glossary.count", terms.length);
+  const q = $("#glossary-search").value.trim();
+  $("#glossary-count").textContent = filtered ? t("glossary.count_matching", { n: fmt(terms.length) }) : tn("glossary.count", terms.length);
   if (!terms.length) {
-    $("#glossary-list").innerHTML = q
-      ? `<div class="empty"><h3>${esc(t("glossary.no_match_title", { q }))}</h3><p>${esc(t("glossary.no_match_body"))}</p></div>`
+    $("#glossary-list").innerHTML = filtered
+      ? `<div class="empty"><h3>${esc(q ? t("glossary.no_match_title", { q }) : t("sets.empty_set"))}</h3><p>${esc(t("glossary.no_match_body"))}</p></div>`
       : `<div class="empty"><h3>${esc(t("glossary.empty_title"))}</h3><p>${esc(t("glossary.empty_body"))}</p><p style="margin-top:16px"><button class="btn" type="button" id="add-examples">${esc(t("glossary.add_examples"))}</button></p></div>`;
     $("#add-examples")?.addEventListener("click", async () => {
       const examples = [
@@ -324,17 +362,31 @@ function renderGlossary(q) {
     });
     return;
   }
-  $("#glossary-list").innerHTML = `<table class="glossary-table"><thead><tr><th>${esc(t("glossary.col_term"))}</th><th>${esc(t("glossary.col_translation"))}</th><th>${esc(t("glossary.col_language"))}</th><th>${esc(t("glossary.col_note"))}</th><th class="num">${esc(t("glossary.col_used"))}</th><th><span class="sr-only">${esc(t("glossary.col_actions"))}</span></th></tr></thead><tbody>${
-    terms.map((x) => `<tr data-id="${x.id}">
+  const sets = multiSet();
+  $("#glossary-list").innerHTML = `<table class="glossary-table${sets ? " with-sets" : ""}"><thead><tr><th class="switch-col"><span class="sr-only">${esc(t("glossary.col_on"))}</span></th><th>${esc(t("glossary.col_term"))}</th><th>${esc(t("glossary.col_translation"))}</th><th>${esc(t("glossary.col_language"))}</th><th>${esc(t("glossary.col_note"))}</th>${sets ? `<th>${esc(t("sets.label"))}</th>` : ""}<th class="num">${esc(t("glossary.col_used"))}</th><th><span class="sr-only">${esc(t("glossary.col_actions"))}</span></th></tr></thead><tbody>${
+    terms.map((x) => `<tr data-id="${x.id}"${x.enabled ? "" : ' class="off"'}>
+      <td class="switch-col"><label class="switch" title="${esc(t(x.enabled ? "glossary.turn_off" : "glossary.turn_on"))}"><input type="checkbox" data-toggle="${x.id}"${x.enabled ? " checked" : ""} aria-label="${esc(t(x.enabled ? "glossary.turn_off" : "glossary.turn_on"))}: ${esc(x.source)}"><span></span></label></td>
       <td class="src"><mark class="term${x.conditional ? " cond" : ""}">${esc(x.source)}</mark>${termPills(x)}</td>
       <td class="tgt">${esc(x.target)}</td>
       <td class="muted">${esc(langName(x.target_lang))}</td>
       <td class="muted small">${esc(x.note)}</td>
+      ${sets ? `<td class="small"><span class="pill pill-set">${esc(setName(x.set_id))}</span></td>` : ""}
       <td class="num muted">${fmt(x.hit_count)}</td>
       <td class="actions"><button class="btn-quiet btn" type="button" data-edit="${x.id}">${esc(t("glossary.edit"))}</button><button class="btn-quiet btn" type="button" data-del="${x.id}">${esc(t("glossary.delete"))}</button></td>
     </tr>`).join("")
   }</tbody></table>`;
 }
+
+$("#glossary-list").addEventListener("change", async (e) => {
+  const box = e.target.closest("[data-toggle]");
+  if (!box) return;
+  const x = state.glossary.find((g) => g.id == box.dataset.toggle);
+  try {
+    await api(`/api/glossary/${x.id}/enabled`, { method: "POST", body: { enabled: box.checked } });
+    toast(t(box.checked ? "glossary.turned_on" : "glossary.turned_off", { term: x.source }));
+    glossaryChanged();
+  } catch (err) { box.checked = !box.checked; toast(err.message, true); }
+});
 
 $("#glossary-list").addEventListener("click", async (e) => {
   const del = e.target.closest("[data-del]");
@@ -352,12 +404,13 @@ $("#glossary-list").addEventListener("click", async (e) => {
       const x = state.glossary.find((g) => g.id == edit.dataset.edit);
       const tr = edit.closest("tr");
       tr.classList.add("editing");
-      tr.innerHTML = `<td><input type="text" class="lang-text" name="source" value="${esc(x.source)}" aria-label="${esc(t("glossary.col_term"))}"></td>
+      tr.innerHTML = `<td class="switch-col"></td><td><input type="text" class="lang-text" name="source" value="${esc(x.source)}" aria-label="${esc(t("glossary.col_term"))}"></td>
         <td><input type="text" class="lang-text" name="target" value="${esc(x.target)}" aria-label="${esc(t("glossary.col_translation"))}"></td>
         <td><select name="target_lang" aria-label="${esc(t("glossary.col_language"))}">${langOptions(x.target_lang)}</select></td>
         <td><input type="text" name="note" value="${esc(x.note)}" aria-label="${esc(t("glossary.col_note"))}" placeholder="${esc(t("glossary.note_ph"))}">
           <label class="check small" style="margin-top:6px"><input type="checkbox" name="case_sensitive"${x.case_sensitive ? " checked" : ""}> ${esc(t("glossary.case_label"))}</label>
           <label class="check small" style="margin-top:4px"><input type="checkbox" name="conditional"${x.conditional ? " checked" : ""}> ${esc(t("glossary.cond_label"))}</label></td>
+        ${multiSet() ? `<td><select name="set_id" aria-label="${esc(t("sets.label"))}">${setOptions(x.set_id)}</select></td>` : ""}
         <td></td>
         <td class="actions"><button class="btn btn-primary" type="button" data-save="${x.id}">${esc(t("glossary.save"))}</button> <button class="btn-quiet btn" type="button" data-cancel>${esc(t("glossary.cancel"))}</button></td>`;
       $("input[name=target]", tr).focus();
@@ -367,13 +420,14 @@ $("#glossary-list").addEventListener("click", async (e) => {
         source: $("[name=source]", tr).value, target: $("[name=target]", tr).value,
         target_lang: $("[name=target_lang]", tr).value, note: $("[name=note]", tr).value,
         case_sensitive: $("[name=case_sensitive]", tr).checked, conditional: $("[name=conditional]", tr).checked,
+        set_id: $("[name=set_id]", tr)?.value || state.glossary.find((g) => g.id == save.dataset.save).set_id,
       };
       if (await saveWithCheck(`/api/glossary/${save.dataset.save}`, "PUT", body)) {
         toast(t("glossary.saved"));
         glossaryChanged();
       }
     } else if (cancel) {
-      renderGlossary($("#glossary-search").value.trim());
+      renderGlossary(true);
     }
   } catch (err) { toast(err.message, true); }
 });
@@ -383,7 +437,7 @@ $("#add-term").addEventListener("submit", async (e) => {
   const f = e.currentTarget;
   const body = {
     source: f.source.value, target: f.target.value, target_lang: f.target_lang.value, note: f.note.value,
-    case_sensitive: f.case_sensitive.checked, conditional: f.conditional.checked,
+    case_sensitive: f.case_sensitive.checked, conditional: f.conditional.checked, set_id: f.set_id.value || 1,
   };
   try {
     if (!(await saveWithCheck("/api/glossary", "POST", body))) return;
@@ -429,6 +483,7 @@ function renderProposals() {
       : t("proposal.new");
     const warn = p.warn?.length ? ` <span class="pill pill-warn" title="${esc(p.warn.map((w) => t("warn." + w)).join(" "))}">${esc(t("glossary.warn_pill"))}</span>` : "";
     const reason = p.note ? `<p class="proposal-reason"><span class="muted small">${esc(t("proposal.reason"))}</span> ${esc(p.note)}</p>` : "";
+    const where = multiSet() ? ` · ${esc(t("sets.in_set", { set: setName(p.set_id) }))}` : "";
     if (p.kind === "remove") {
       const current = p.current
         ? `<span class="term-pair"><mark class="term">${esc(p.current.source)}</mark><span class="arrow">→</span>${esc(p.current.target)}</span>`
@@ -436,7 +491,7 @@ function renderProposals() {
       return `<li data-pid="${p.id}" class="proposal-remove">
         <div class="proposal-main">
           <div class="proposal-head"><span class="pill pill-remove">${esc(t("proposal.remove_pill"))}</span>${current}${warn}</div>
-          <p class="small muted">${esc(langName(p.target_lang))} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
+          <p class="small muted">${esc(langName(p.target_lang))}${where} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
           ${reason}
         </div>
         <div class="proposal-actions">
@@ -449,7 +504,7 @@ function renderProposals() {
     return `<li data-pid="${p.id}">
       <div class="proposal-main">
         <div class="term-pair"><mark class="term">${esc(p.source)}</mark>${warn}<span class="arrow" aria-label="${esc(t("terms.becomes"))}">→</span><input type="text" class="lang-text proposal-target" value="${esc(p.target)}" data-p-target aria-label="${esc(t("glossary.col_translation"))}"></div>
-        <p class="small muted">${esc(status)} · ${esc(langName(p.target_lang))} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
+        <p class="small muted">${esc(status)} · ${esc(langName(p.target_lang))}${where} · ${esc(who)} · ${esc(timeAgo(p.ts))}</p>
         ${reason}
         <label class="field proposal-note"><span class="sr-only">${esc(t("proposal.note_label"))}</span><input type="text" data-p-note value="${esc(noteValue)}" maxlength="300" placeholder="${esc(t("proposal.note_label"))}"></label>
       </div>
@@ -498,7 +553,13 @@ function historyChanges(prev, next) {
   if (prev.note !== next.note) parts.push(esc(next.note ? t("history.note_set", { note: next.note }) : t("history.note_cleared")));
   if (prev.case_sensitive !== next.case_sensitive) parts.push(esc(t(next.case_sensitive ? "history.case_on" : "history.case_off")));
   if (prev.conditional !== next.conditional) parts.push(esc(t(next.conditional ? "history.cond_on" : "history.cond_off")));
+  if (prev.set_id !== next.set_id) parts.push(`${esc(setName(prev.set_id))} → ${esc(setName(next.set_id))}`);
   return parts.join(" · ");
+}
+/** True when the only change is the on/off switch. */
+function onlySwitched(prev, next) {
+  return prev && next && prev.enabled !== next.enabled &&
+    ["source", "target", "target_lang", "note", "case_sensitive", "conditional", "set_id"].every((k) => prev[k] === next[k]);
 }
 
 function historyLine(e) {
@@ -506,6 +567,7 @@ function historyLine(e) {
   const pair = (s) => `<span class="term-pair"><mark class="term">${esc(s.source)}</mark><span class="arrow">→</span>${esc(s.target)}</span>`;
   if (e.action === "add") return [t("history.added", { term }), pair(e.next)];
   if (e.action === "delete") return [t("history.deleted", { term }), pair(e.prev)];
+  if (onlySwitched(e.prev, e.next)) return [t(e.next.enabled ? "history.turned_on" : "history.turned_off", { term }), pair(e.next)];
   if (e.action === "edit") return [t("history.edited", { term }), historyChanges(e.prev, e.next)];
   // undo: describe what it restored
   if (!e.next) return [t("history.undo_removed", { term }), pair(e.prev)];
@@ -576,7 +638,7 @@ $("#suggest-add").addEventListener("click", async () => {
   });
   if (!picked.length) return toast(t("suggest.tick_one"), true);
   try {
-    const res = await api("/api/glossary/bulk", { method: "POST", body: { terms: picked } });
+    const res = await api("/api/glossary/bulk", { method: "POST", body: { terms: picked, set_id: $("#add-term select[name=set_id]").value || 1 } });
     toast(tn("suggest.added", res.added));
     $("#suggest-results").hidden = true;
     $("#suggest-status").textContent = "";
@@ -584,8 +646,149 @@ $("#suggest-add").addEventListener("click", async () => {
   } catch (err) { toast(err.message, true); }
 });
 
+/* ---------------- glossary sets and links ---------------- */
+async function loadSetsView() {
+  await loadSets();
+  renderSets();
+  renderLinks();
+}
+
+function renderSets() {
+  const movable = state.sets.filter((x) => x.id !== 1);
+  $("#set-list").innerHTML = state.sets.map((x) => {
+    const i = movable.findIndex((m) => m.id === x.id);
+    const general = x.id === 1;
+    return `<li data-set="${x.id}">
+      <div class="set-main"><strong>${esc(setName(x.id))}</strong> <span class="muted small">${esc(tn("glossary.count", x.terms))}</span>${general ? ` <span class="pill">${esc(t("sets.general_pill"))}</span>` : ""}</div>
+      <div class="set-actions">
+        ${general ? "" : `<button class="btn btn-quiet" type="button" data-move="-1" ${i <= 0 ? "disabled" : ""} aria-label="${esc(t("sets.up"))}" title="${esc(t("sets.up"))}">↑</button>
+        <button class="btn btn-quiet" type="button" data-move="1" ${i >= movable.length - 1 ? "disabled" : ""} aria-label="${esc(t("sets.down"))}" title="${esc(t("sets.down"))}">↓</button>`}
+        <a class="btn btn-quiet" href="#glossary" data-show-set="${x.id}">${esc(t("sets.show_terms"))}</a>
+        <button class="btn btn-quiet" type="button" data-rename>${esc(t("sets.rename"))}</button>
+        ${general ? "" : `<button class="btn btn-quiet" type="button" data-delete-set>${esc(t("glossary.delete"))}</button>`}
+      </div>
+    </li>`;
+  }).join("");
+}
+
+function renderLinks() {
+  $("#link-list").innerHTML = state.links.map((l) => `<div class="panel link-card" data-link="${l.id}">
+    <div class="link-head">
+      <h3>${esc(linkName(l))}</h3>
+      <div class="row">
+        ${l.default ? `<span class="pill">${esc(t("links.default_pill"))}</span>` : `<button class="btn btn-quiet" type="button" data-rename-link>${esc(t("sets.rename"))}</button><button class="btn btn-quiet" type="button" data-delete-link>${esc(t("glossary.delete"))}</button>`}
+      </div>
+    </div>
+    <p class="small muted">${esc(t(l.default ? "links.default_help" : "links.uses"))}</p>
+    <div class="link-sets">${state.sets.map((x) => `<label class="check"><input type="checkbox" data-link-set="${x.id}"${l.set_ids.includes(x.id) ? " checked" : ""}> ${esc(setName(x.id))}</label>`).join("")}</div>
+    <div class="link-addr">
+      <span class="small muted">${esc(t("links.api_address"))}</span>
+      <div class="copy-field"><code id="link-api-${l.id}">${esc(l.openai)}</code><button class="btn" type="button" data-copy="link-api-${l.id}">${esc(t("connect.copy"))}</button></div>
+      <span class="small muted">${esc(t("links.member_page"))}</span>
+      <div class="copy-field"><code id="link-member-${l.id}">${esc(l.suggest_url)}</code><button class="btn" type="button" data-copy="link-member-${l.id}">${esc(t("connect.copy"))}</button></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="btn btn-primary" type="button" data-copy-invite="${l.id}">${esc(t("links.copy_invite"))}</button></div>
+  </div>`).join("");
+}
+
+$("#set-list").addEventListener("click", async (e) => {
+  const li = e.target.closest("li[data-set]");
+  if (!li) return;
+  const id = Number(li.dataset.set);
+  const x = state.sets.find((s) => s.id === id);
+  try {
+    if (e.target.closest("[data-move]")) {
+      await api(`/api/sets/${id}/move`, { method: "POST", body: { direction: Number(e.target.closest("[data-move]").dataset.move) } });
+    } else if (e.target.closest("[data-rename]")) {
+      const name = prompt(t("sets.rename_prompt"), setName(id));
+      if (!name || !name.trim()) return;
+      await api(`/api/sets/${id}`, { method: "PUT", body: { name } });
+    } else if (e.target.closest("[data-delete-set]")) {
+      if (!confirm(t("sets.confirm_delete", { set: setName(id) }))) return;
+      await api(`/api/sets/${id}`, { method: "DELETE" });
+      toast(t("sets.deleted", { set: x.name }));
+    } else if (e.target.closest("[data-show-set]")) {
+      $("#glossary-set-filter").value = id;  // the glossary view opens filtered to this set
+      return;
+    } else return;
+    loadSetsView();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#add-set").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.currentTarget;
+  try {
+    await api("/api/sets", { method: "POST", body: { name: f.name.value } });
+    toast(t("sets.added", { set: f.name.value.trim() }));
+    f.reset();
+    loadSetsView();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#link-list").addEventListener("change", async (e) => {
+  const box = e.target.closest("[data-link-set]");
+  if (!box) return;
+  const card = box.closest("[data-link]");
+  const ids = $$("[data-link-set]", card).filter((c) => c.checked).map((c) => Number(c.dataset.linkSet));
+  try {
+    await api(`/api/links/${card.dataset.link}`, { method: "PUT", body: { set_ids: ids } });
+    toast(t("links.saved"));
+    await loadSets();
+    renderLinks();
+  } catch (err) { box.checked = !box.checked; toast(err.message, true); }
+});
+
+$("#link-list").addEventListener("click", async (e) => {
+  const card = e.target.closest("[data-link]");
+  if (!card) return;
+  const link = state.links.find((l) => l.id == card.dataset.link);
+  try {
+    if (e.target.closest("[data-copy-invite]")) {
+      const key = state.overview?.team_key || (await api("/api/overview")).team_key;
+      copyText(t("invite.text", { url: link.openai, key }) + "\n\n" + t("invite.member", { link: link.suggest_url }), t("toast.invite_copied"));
+      return;
+    }
+    if (e.target.closest("[data-rename-link]")) {
+      const name = prompt(t("links.rename_prompt"), link.name);
+      if (!name || !name.trim()) return;
+      await api(`/api/links/${link.id}`, { method: "PUT", body: { name } });
+    } else if (e.target.closest("[data-delete-link]")) {
+      if (!confirm(t("links.confirm_delete", { link: link.name }))) return;
+      await api(`/api/links/${link.id}`, { method: "DELETE" });
+    } else return;
+    await loadSets();
+    renderLinks();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#add-link").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.currentTarget;
+  try {
+    await api("/api/links", { method: "POST", body: { name: f.name.value, set_ids: [1] } });
+    toast(t("links.added", { link: f.name.value.trim() }));
+    f.reset();
+    await loadSets();
+    renderLinks();
+  } catch (err) { toast(err.message, true); }
+});
+
 /* ---------------- try it ---------------- */
 let lastTry = null;  // kept so a language switch can redraw the result in the new language
+
+function linkName(link) {
+  return link.default ? t("links.default") : link.name;
+}
+
+async function loadTryView() {
+  await loadSets();
+  const sel = $("#try-link");
+  const keep = Number(sel.value || 1);
+  sel.innerHTML = state.links.map((l) => `<option value="${l.id}"${l.id === keep ? " selected" : ""}>${esc(t("try.through", { link: linkName(l) }))}</option>`).join("");
+  sel.closest("label").hidden = state.links.length < 2;
+  renderTry();
+}
 
 function renderTry() {
   if (!lastTry) {
@@ -630,7 +833,7 @@ $("#try-form").addEventListener("submit", (e) => {
   const btn = $("button[type=submit]", f);
   busy(btn, t("try.busy"), async () => {
     try {
-      lastTry = { result: await api("/api/translate", { method: "POST", body: { text: f.text.value, target_lang: f.target_lang.value } }) };
+      lastTry = { result: await api("/api/translate", { method: "POST", body: { text: f.text.value, target_lang: f.target_lang.value, link_id: f.link_id.value || 1 } }) };
     } catch (err) {
       lastTry = { error: err };
     }

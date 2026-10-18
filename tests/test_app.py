@@ -68,7 +68,7 @@ def test_setup_login_flow(client):
     assert r.status_code == 401 and r.json()["code"] == "not_signed_in"
     setup_admin(client)
     assert client.get("/api/me").json() == {
-        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.3.1",
+        "authenticated": True, "setup_required": False, "team_name": "UNSW CSSA", "version": "0.4.0",
     }
     client.post("/api/logout")
     r = client.post("/api/login", json={"password": "nope"})
@@ -549,6 +549,126 @@ def test_teammates_can_try_translations(client):
     assert [r["endpoint"] for r in client.get("/api/stats").json()["recent"]] == ["member", "immersive", "member"]
 
 
+# ------------------------------------------------------------------ disabling terms, sets and links (v0.4)
+def test_disabling_a_term_keeps_its_memory(client):
+    key = setup_admin(client)
+    term = client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"}).json()
+    text = ["The census date is Sunday."]
+    assert "退课截止日" in imme(client, key, text).json()["translations"][0]["text"]
+    assert client.post(f"/api/glossary/{term['id']}/enabled", json={"enabled": False}).json()["enabled"] == 0
+    assert "退课截止日" not in imme(client, key, text).json()["translations"][0]["text"]
+    assert mock_llm.app.state.calls == 2
+    # Turning it back on finds the earlier translation in memory: no new AI call.
+    client.post(f"/api/glossary/{term['id']}/enabled", json={"enabled": True})
+    assert "退课截止日" in imme(client, key, text).json()["translations"][0]["text"]
+    assert mock_llm.app.state.calls == 2
+    # Both switches are in the history, and undoing one works like any other change.
+    groups = client.get("/api/glossary/history").json()["groups"]
+    assert [g["entries"][0]["next"]["enabled"] for g in groups[:2]] == [1, 0]
+    client.post(f"/api/glossary/history/{groups[0]['id']}/undo")
+    assert client.get("/api/glossary").json()["terms"][0]["enabled"] == 0
+    # Editing a disabled term keeps it disabled.
+    t = client.get("/api/glossary").json()["terms"][0]
+    assert client.put(f"/api/glossary/{t['id']}", json={**t, "note": "UNSW"}).json()["enabled"] == 0
+
+
+def test_links_choose_which_sets_apply(client):
+    key = setup_admin(client)
+    h = {"Authorization": f"Bearer {key}"}
+    stats = client.post("/api/sets", json={"name": "Statistics"}).json()
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    client.post("/api/glossary", json={"source": "census date", "target": "人口普查日", "set_id": stats["id"]})
+    link = client.post("/api/links", json={"name": "Stats group", "set_ids": [1, stats["id"]]}).json()
+    assert link["openai"].endswith(f"/g/{link['slug']}/v1/chat/completions")
+    assert link["suggest_url"].endswith(f"&link={link['slug']}")
+
+    text = ["The census date is Sunday.", "Student News"]
+    default = imme(client, key, text).json()["translations"]
+    assert "退课截止日" in default[0]["text"]
+    r = client.post(f"/g/{link['slug']}/imme?token={key}", json={"target_lang": "zh-CN", "text_list": text})
+    grouped = r.json()["translations"]
+    assert "人口普查日" in grouped[0]["text"]  # Statistics comes before General in this link
+    # Paragraphs without a term that differs are shared between links: only the census sentence was new.
+    assert mock_llm.app.state.batch_sizes == [2, 1]
+
+    r = client.post(f"/g/{link['slug']}/v1/chat/completions", json=immersive_prompt(["Census dates"]), headers=h)
+    assert "人口普查日" in r.json()["choices"][0]["message"]["content"]
+    r = client.post(f"/g/nope/v1/chat/completions", json=immersive_prompt(["Hi"]), headers=h)
+    assert r.status_code == 404 and r.json()["code"] == "link_not_found"
+    assert client.post(f"/g/{link['slug']}/imme", json={"text_list": ["x y"]}).status_code == 401
+
+    # The dashboard's Try it can look through any link.
+    item = client.post("/api/translate", json={"text": "The census date is Sunday.", "link_id": link["id"]}).json()
+    assert item["items"][0]["cached"] is True and "人口普查日" in item["items"][0]["text"]
+
+
+def test_teammates_work_inside_their_link(client):
+    key = setup_admin(client)
+    h = {"Authorization": f"Bearer {key}"}
+    stats = client.post("/api/sets", json={"name": "Statistics"}).json()
+    client.post("/api/glossary", json={"source": "census date", "target": "退课截止日"})
+    client.post("/api/glossary", json={"source": "census date", "target": "人口普查", "set_id": stats["id"]})
+    client.post("/api/glossary", json={"source": "tutorial", "target": "辅导课"})
+    off = client.post("/api/glossary", json={"source": "lecture", "target": "讲座"}).json()
+    client.post(f"/api/glossary/{off['id']}/enabled", json={"enabled": False})
+    link = client.post("/api/links", json={"name": "Stats group", "set_ids": [stats["id"], 1]}).json()
+
+    g = client.get(f"/api/team/glossary?link={link['slug']}", headers=h).json()
+    assert g["link_name"] == "Stats group"
+    assert [(t["source"], t["target"]) for t in g["terms"]] == [("census date", "人口普查"), ("tutorial", "辅导课")]
+    default_terms = client.get("/api/team/glossary", headers=h).json()["terms"]
+    assert ("census date", "退课截止日") in [(t["source"], t["target"]) for t in default_terms]
+
+    # A fix suggested through the link changes the term in the set that link uses.
+    pid = client.post("/api/team/proposals", headers=h, json={
+        "link": link["slug"], "source": "census date", "target": "人口普查日"}).json()["id"]
+    p = client.get("/api/proposals").json()["proposals"][0]
+    assert p["set_id"] == stats["id"] and p["current"]["target"] == "人口普查"
+    client.post(f"/api/proposals/{pid}/approve", json={})
+    targets = {(t["set_id"], t["target"]) for t in client.get("/api/glossary").json()["terms"] if t["source"] == "census date"}
+    assert targets == {(1, "退课截止日"), (stats["id"], "人口普查日")}
+    # A new term suggested through the link goes into the link's first set.
+    client.post("/api/team/proposals", headers=h, json={"link": link["slug"], "source": "sample mean", "target": "样本均值"})
+    assert client.get("/api/proposals").json()["proposals"][0]["set_id"] == stats["id"]
+    r = client.post("/api/team/translate", headers=h, json={"link": link["slug"], "text": "The census date"})
+    assert "人口普查日" in r.json()["items"][0]["text"]
+
+
+def test_set_and_link_rules(client):
+    setup_admin(client)
+    a = client.post("/api/sets", json={"name": "A"}).json()
+    b = client.post("/api/sets", json={"name": "B"}).json()
+    assert client.post("/api/sets", json={"name": "a"}).json()["code"] == "set_exists"
+    assert client.delete("/api/sets/1").json()["code"] == "set_protected"
+    client.post("/api/glossary", json={"source": "tutorial", "target": "辅导课", "set_id": a["id"]})
+    r = client.delete(f"/api/sets/{a['id']}")
+    assert r.status_code == 409 and r.json()["code"] == "set_not_empty" and r.json()["params"] == {"n": 1}
+    assert client.delete("/api/links/1").json()["code"] == "link_protected"
+    assert client.post("/api/links", json={"name": "X", "set_ids": []}).json()["code"] == "link_needs_set"
+    assert client.post("/api/glossary", json={"source": "x y", "target": "z", "set_id": 99}).json()["code"] == "set_not_found"
+    # Priority: General is always last; the others can be reordered.
+    assert [s["id"] for s in client.get("/api/sets").json()["sets"]] == [a["id"], b["id"], 1]
+    client.post(f"/api/sets/{b['id']}/move", json={"direction": -1})
+    assert [s["id"] for s in client.get("/api/sets").json()["sets"]] == [b["id"], a["id"], 1]
+    link = client.post("/api/links", json={"name": "Both", "set_ids": [1, a["id"], b["id"]]}).json()
+    assert link["set_ids"] == [b["id"], a["id"], 1]
+    # The same word may exist once per set, not twice in one set.
+    t = client.post("/api/glossary", json={"source": "tutorial", "target": "导修课", "set_id": b["id"]}).json()
+    r = client.put(f"/api/glossary/{t['id']}", json={**t, "set_id": a["id"]})
+    assert r.json()["code"] == "term_exists"
+
+
+def test_csv_keeps_sets_and_switches(client):
+    setup_admin(client)
+    csv_text = "source,target,set,enabled\ncensus date,人口普查日,Statistics,1\ntutorial,辅导课,,0\n"
+    assert client.post("/api/glossary/import", json={"csv": csv_text}).json() == {"added": 2, "skipped": 0}
+    sets = {s["name"]: s["id"] for s in client.get("/api/sets").json()["sets"]}
+    terms = {t["source"]: t for t in client.get("/api/glossary").json()["terms"]}
+    assert terms["census date"]["set_id"] == sets["Statistics"] and terms["tutorial"]["enabled"] == 0
+    exported = client.get("/api/glossary/export").text
+    assert "census date,人口普查日,zh-CN,,0,0,Statistics,1" in exported
+
+
 def test_proposals_are_rate_limited(client, monkeypatch):
     from app import main as mainmod
 
@@ -630,3 +750,34 @@ def test_upgrade_from_v3_proposals(tmp_path):
 def test_healthz_and_index(client):
     assert client.get("/healthz").json()["ok"] is True
     assert client.get("/").status_code == 200
+
+
+def test_upgrade_from_v31_glossary_keeps_ids_and_history(tmp_path):
+    path = tmp_path / "v31.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE glossary (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, target TEXT NOT NULL, "
+        "target_lang TEXT NOT NULL DEFAULT 'zh-CN', note TEXT NOT NULL DEFAULT '', "
+        "case_sensitive INTEGER NOT NULL DEFAULT 0, conditional INTEGER NOT NULL DEFAULT 0, "
+        "hit_count INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL, "
+        "UNIQUE (source, target_lang));"
+        "INSERT INTO glossary (id, source, target, hit_count, created_at, updated_at) VALUES (7, 'census date', '截止日', 5, 1, 1);"
+        "CREATE TABLE glossary_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, action TEXT NOT NULL, "
+        "batch TEXT NOT NULL DEFAULT '', term_id INTEGER NOT NULL DEFAULT 0, prev_state TEXT NOT NULL DEFAULT '', "
+        "next_state TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', undo_of INTEGER NOT NULL DEFAULT 0, "
+        "undone INTEGER NOT NULL DEFAULT 0);"
+    )
+    old = '{"case_sensitive": 0, "conditional": 0, "note": "", "source": "census date", "target_lang": "zh-CN", "target": '
+    con.execute("INSERT INTO glossary_history (ts, action, term_id, prev_state, next_state) VALUES (1, 'edit', 7, ?, ?)",
+                (old + '"退课截止日"}', old + '"截止日"}'))
+    con.commit()
+    con.close()
+    database = dbmod.Database(path)
+    row = database.get_term(7)
+    assert (row["set_id"], row["enabled"], row["hit_count"]) == (1, 1, 5)
+    # A change saved by v0.3 (no set or switch in it) can still be undone after the upgrade.
+    entry = database.list_history()[0]["entries"][0]
+    database.undo(entry["id"])
+    assert database.get_term(7)["target"] == "退课截止日"
+    assert database.list_links()[0]["set_ids"] == [1]
+

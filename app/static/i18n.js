@@ -108,7 +108,7 @@ function applyStatic() {
 
 async function loadI18n() {
   try {
-    const res = await fetch("/static/i18n.json?v=0.3.1");
+    const res = await fetch("/static/i18n.json?v=0.4.0");
     I18N = await res.json();
   } catch { /* keep the built-in English fallback */ }
   const saved = storedLang();
